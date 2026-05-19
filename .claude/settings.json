@@ -1,0 +1,19 @@
+﻿{
+  "permissions": {
+    "allow": [
+      "Read:./**",
+      "Write:./**",
+      "Edit:./**",
+      "Bash:git:*",
+      "Bash:python:*",
+      "Bash:pip:*",
+      "Bash:python3:*"
+    ],
+    "deny": [
+      "Read:./.env",
+      "Read:./secrets/**",
+      "Bash:sudo:*",
+      "Bash:rm -rf:*"
+    ]
+  }
+}
