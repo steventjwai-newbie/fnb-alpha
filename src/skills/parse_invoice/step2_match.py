@@ -36,6 +36,9 @@ LLM_CONFIDENCE_THRESHOLD = 0.5
 TOP_CANDIDATES = 5
 
 _PRODUCT_CACHE: Optional[List[Dict[str, Any]]] = None
+_SUPPLIER_CACHE: Optional[List[Dict[str, Any]]] = None
+
+SUPPLIER_FUZZY_THRESHOLD = 75
 
 
 def _load_seatable_products() -> List[Dict[str, Any]]:
@@ -56,6 +59,85 @@ def _load_seatable_products() -> List[Dict[str, Any]]:
     _PRODUCT_CACHE = products
     print(f"[LOG] Loaded {len(products)} products from Seatable")
     return products
+
+
+def _load_seatable_suppliers() -> List[Dict[str, Any]]:
+    global _SUPPLIER_CACHE
+    if _SUPPLIER_CACHE is not None:
+        return _SUPPLIER_CACHE
+
+    base = Base(SEATABLE_API_TOKEN, SEATABLE_BASE_URL)
+    base.auth()
+    rows = base.list_rows("Suppliers")
+
+    suppliers = []
+    for row in rows:
+        name = row.get("Supplier Name") or ""
+        if name:
+            suppliers.append({"name": name, "id": row.get("_id", "")})
+
+    _SUPPLIER_CACHE = suppliers
+    print(f"[LOG] Loaded {len(suppliers)} suppliers from Seatable")
+    return suppliers
+
+
+def _check_invoice_supplier(supplier_name: str, suppliers: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Returns supplier match result with _candidates for Tier 3."""
+    if not supplier_name:
+        return {
+            "match_tier": 3,
+            "match_confidence": 0.0,
+            "matched_supplier_name": None,
+            "matched_supplier_id": None,
+            "match_reason": "missing supplier name",
+            "_candidates": [],
+        }
+
+    norm = _normalize(supplier_name)
+
+    # Tier 1: exact
+    for s in suppliers:
+        if _normalize(s["name"]) == norm:
+            return {
+                "match_tier": 1,
+                "match_confidence": 1.0,
+                "matched_supplier_name": s["name"],
+                "matched_supplier_id": s["id"],
+                "match_reason": "exact match",
+                "_candidates": [],
+            }
+
+    # Tier 2: fuzzy
+    names = [s["name"] for s in suppliers]
+    scored = process.extract(supplier_name, names, scorer=fuzz.token_sort_ratio, limit=TOP_CANDIDATES)
+
+    if scored:
+        best_name, best_score, best_idx = scored[0]
+        candidates = [
+            {"name": name, "id": suppliers[idx]["id"], "score": score}
+            for name, score, idx in scored
+        ]
+        if best_score >= SUPPLIER_FUZZY_THRESHOLD:
+            return {
+                "match_tier": 2,
+                "match_confidence": round(best_score / 100, 4),
+                "matched_supplier_name": suppliers[best_idx]["name"],
+                "matched_supplier_id": suppliers[best_idx]["id"],
+                "match_reason": f"fuzzy match (score={best_score})",
+                "_candidates": [],
+            }
+    else:
+        candidates = []
+
+    # Tier 3: manual
+    return {
+        "match_tier": 3,
+        "match_confidence": round(scored[0][1] / 100, 4) if scored else 0.0,
+        "matched_supplier_name": None,
+        "matched_supplier_id": None,
+        "match_reason": f"manual review needed: best fuzzy score={scored[0][1] if scored else 0}",
+        "_candidates": candidates,
+    }
 
 
 def _normalize(s: str) -> str:
@@ -103,7 +185,8 @@ def _llm_match(
             "_candidates": [],
         }
     except Exception as e:
-        print(f"[LOG] LLM match failed for '{product_name}': {e}")
+        safe = product_name.encode("ascii", "replace").decode("ascii")
+        print(f"[LOG] LLM match failed for '{safe}': {type(e).__name__}")
         return None
 
 
@@ -184,16 +267,19 @@ def _match_item(product_name: str, products: List[Dict[str, Any]]) -> Dict[str, 
 
 def match_step1_result(
     step1_result: Dict[str, Any],
-) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
-    Returns (enhanced_result, tier4_groups) where tier4_groups is a list of
-    {invoice, file_path, items: [{id, product_name, quantity, unit, unit_price, candidates}]}
-    ready for storage and notification.
+    Returns (enhanced_result, product_tier4_groups, supplier_tier3_groups).
+
+    product_tier4_groups: [{invoice, file_path, items: [{product_name, quantity, unit, unit_price, candidates}]}]
+    supplier_tier3_groups: [{invoice_number, supplier_name, file_path, candidates}]
     """
     products = _load_seatable_products()
+    suppliers = _load_seatable_suppliers()
     result = dict(step1_result)
     enhanced_invoices = []
-    tier4_groups: List[Dict[str, Any]] = []
+    product_tier4_groups: List[Dict[str, Any]] = []
+    supplier_tier3_groups: List[Dict[str, Any]] = []
 
     for invoice in result.get("invoices", []):
         invoice = dict(invoice)
@@ -201,6 +287,19 @@ def match_step1_result(
         enhanced_items = []
         tier4_items: List[Dict[str, Any]] = []
 
+        # Supplier check
+        supplier_match = _check_invoice_supplier(invoice.get("supplier_name") or "", suppliers)
+        supplier_candidates = supplier_match.pop("_candidates")
+        invoice["supplier_match"] = supplier_match
+        if supplier_match["match_tier"] == 3:
+            supplier_tier3_groups.append({
+                "invoice_number": invoice.get("invoice_number") or "",
+                "supplier_name": invoice.get("supplier_name") or "",
+                "file_path": result.get("file_path", ""),
+                "candidates": supplier_candidates,
+            })
+
+        # Line item matching
         for item in invoice.get("line_items", []):
             item = dict(item)
             match = _match_item(item.get("product_name") or "", products)
@@ -229,14 +328,14 @@ def match_step1_result(
         enhanced_invoices.append(invoice)
 
         if tier4_items:
-            tier4_groups.append({
+            product_tier4_groups.append({
                 "invoice": invoice,
                 "file_path": result.get("file_path", ""),
                 "items": tier4_items,
             })
 
     result["invoices"] = enhanced_invoices
-    return result, tier4_groups
+    return result, product_tier4_groups, supplier_tier3_groups
 
 
 class _DecimalEncoder(json.JSONEncoder):
@@ -255,7 +354,8 @@ def main():
 
     from step1_extract import extract_invoice
     from pending_matches_store import add_pending_item
-    from notifier import notify_tier4_items
+    from pending_suppliers_store import add_pending_supplier
+    from notifier import notify_tier4_items, notify_missing_supplier
 
     print(f"[LOG] Running step1 extraction on: {file_path}")
     step1_result = extract_invoice(file_path)
@@ -266,10 +366,10 @@ def main():
         sys.exit(1)
 
     print("[LOG] Running step2 matching...")
-    enhanced, tier4_groups = match_step1_result(step1_result)
+    enhanced, product_tier4_groups, supplier_tier3_groups = match_step1_result(step1_result)
 
-    # Store and notify Tier 4 items
-    for group in tier4_groups:
+    # Store and notify unmatched products (Tier 4)
+    for group in product_tier4_groups:
         inv = group["invoice"]
         stored_records = []
         for t4 in group["items"]:
@@ -284,9 +384,27 @@ def main():
                 candidates=t4["candidates"],
             )
             stored_records.append({"id": record_id, **t4})
-            safe_name = t4['product_name'].encode('ascii', 'replace').decode('ascii')
-            print(f"[LOG] Tier 4 stored: {safe_name} id={record_id}")
+            safe_name = t4["product_name"].encode("ascii", "replace").decode("ascii")
+            print(f"[LOG] Tier 4 product stored: {safe_name} id={record_id}")
         notify_tier4_items(inv, stored_records, group["file_path"])
+
+    # Store and notify unmatched suppliers (Tier 3)
+    for s in supplier_tier3_groups:
+        record_id = add_pending_supplier(
+            invoice_number=s["invoice_number"],
+            invoice_supplier_name=s["supplier_name"],
+            file_path=s["file_path"],
+            candidates=s["candidates"],
+        )
+        safe_name = s["supplier_name"].encode("ascii", "replace").decode("ascii")
+        print(f"[LOG] Tier 3 supplier stored: {safe_name} id={record_id}")
+        notify_missing_supplier(
+            invoice_number=s["invoice_number"],
+            supplier_name=s["supplier_name"],
+            record_id=record_id,
+            candidates=s["candidates"],
+            file_path=s["file_path"],
+        )
 
     print(json.dumps(enhanced, cls=_DecimalEncoder, indent=2))
 

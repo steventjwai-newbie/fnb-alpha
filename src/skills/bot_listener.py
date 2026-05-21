@@ -2,12 +2,15 @@
 Telegram bot listener for seatable_update_bot.
 Polls for user replies to Tier-4 unmatched items and handles:
 
-  link <id> <N>             — link item to fuzzy candidate N
-  new <id> <ingredient>     — create new Supplier Product row in Seatable
-  skip <id>                 — dismiss, mark as skipped
-  /yes                      — confirm pending action
-  /no  or  /cancel          — cancel pending action
-  /pending                  — list all unresolved Tier-4 items
+  link <id> <N>                       — link product to fuzzy candidate N
+  new <id> <ingredient>               — create new Supplier Product row
+  skip <id>                           — dismiss product match
+  newsupplier <id>                    — create new Supplier row
+  linksupplier <id> <N>               — link invoice supplier to candidate N
+  skipsupplier <id>                   — dismiss supplier match
+  /yes                                — confirm pending action
+  /no  or  /cancel                    — cancel pending action
+  /pending                            — list all unresolved items (products + suppliers)
   /addproduct <name> | <ingredient>   — manual product creation
 
 Run via Windows Task Scheduler every 5 minutes:
@@ -29,6 +32,7 @@ load_dotenv()
 sys.path.insert(0, str(Path(__file__).parent / "parse_invoice"))
 
 from pending_matches_store import get_by_id, get_all_pending, resolve
+import pending_suppliers_store as _sup_store
 
 _BOT_TOKEN = os.getenv("SEATABLE_BOT_TOKEN")
 _CHAT_ID = os.getenv("SEATABLE_BOT_CHAT_ID", "-5150446443")
@@ -280,6 +284,25 @@ def _handle_yes(state: Dict[str, Any]) -> None:
         except Exception as e:
             _send(f"❌ Failed to create product: {e}")
 
+    elif action == "newsupplier":
+        _send("Creating new Supplier in Seatable...")
+        try:
+            base = _seatable_base()
+            new_row = base.append_row("Suppliers", {"Supplier Name": conf["supplier_name"]})
+            new_id = new_row.get("_id", "")
+            _sup_store.resolve(conf["record_id"], {"type": "created", "new_supplier_id": new_id})
+            _send(f"✅ Created supplier *{conf['supplier_name']}*.")
+        except Exception as e:
+            _send(f"❌ Failed to create supplier: {e}")
+
+    elif action == "linksupplier":
+        _sup_store.resolve(conf["record_id"], {
+            "type": "linked",
+            "matched_supplier_name": conf["matched_supplier_name"],
+            "matched_supplier_id": conf["matched_supplier_id"],
+        })
+        _send(f"✅ Linked *{conf['invoice_supplier_name']}* → *{conf['matched_supplier_name']}*.")
+
 
 def _handle_addproduct(text: str, state: Dict[str, Any]) -> None:
     # /addproduct <name> | <ingredient>
@@ -308,18 +331,111 @@ def _handle_addproduct(text: str, state: Dict[str, Any]) -> None:
     )
 
 
+def _handle_newsupplier(parts: list, state: Dict[str, Any]) -> None:
+    # newsupplier <record_id>
+    if len(parts) < 2:
+        _send("Usage: `newsupplier <id>`")
+        return
+    record_id = parts[1]
+    record = _sup_store.get_by_id(record_id)
+    if not record:
+        _send(f"No pending supplier with id `{record_id}`.")
+        return
+    if record["status"] != "pending":
+        _send(f"`{record_id}` is already resolved ({record['status']}).")
+        return
+
+    state["pending_confirmation"] = {
+        "action": "newsupplier",
+        "record_id": record_id,
+        "supplier_name": record["invoice_supplier_name"],
+    }
+    _send(
+        f"Confirm: create new supplier *{record['invoice_supplier_name']}*?\n"
+        f"Reply `/yes` to confirm or `/no` to cancel."
+    )
+
+
+def _handle_linksupplier(parts: list, state: Dict[str, Any]) -> None:
+    # linksupplier <record_id> <N>
+    if len(parts) < 3:
+        _send("Usage: `linksupplier <id> <candidate number>`")
+        return
+    record_id, num_str = parts[1], parts[2]
+    if not num_str.isdigit():
+        _send("Candidate number must be a digit, e.g. `linksupplier abc12345 2`")
+        return
+    num = int(num_str)
+
+    record = _sup_store.get_by_id(record_id)
+    if not record:
+        _send(f"No pending supplier with id `{record_id}`.")
+        return
+    if record["status"] != "pending":
+        _send(f"`{record_id}` is already resolved ({record['status']}).")
+        return
+
+    candidates = record.get("candidates", [])
+    if num < 1 or num > len(candidates):
+        _send(f"Candidate {num} out of range (1–{len(candidates)}).")
+        return
+
+    chosen = candidates[num - 1]
+    state["pending_confirmation"] = {
+        "action": "linksupplier",
+        "record_id": record_id,
+        "invoice_supplier_name": record["invoice_supplier_name"],
+        "matched_supplier_name": chosen["name"],
+        "matched_supplier_id": chosen["id"],
+    }
+    _send(
+        f"Confirm: *{record['invoice_supplier_name']}* → *{chosen['name']}*?\n"
+        f"Reply `/yes` to confirm or `/no` to cancel."
+    )
+
+
+def _handle_skipsupplier(parts: list) -> None:
+    if len(parts) < 2:
+        _send("Usage: `skipsupplier <id>`")
+        return
+    record_id = parts[1]
+    record = _sup_store.get_by_id(record_id)
+    if not record:
+        _send(f"No pending supplier with id `{record_id}`.")
+        return
+    _sup_store.resolve(record_id, {"type": "skipped"})
+    _send(f"Skipped supplier `{record['invoice_supplier_name']}` ({record_id}).")
+
+
 def _handle_pending() -> None:
-    records = get_all_pending()
-    if not records:
+    products = get_all_pending()
+    suppliers = _sup_store.get_all_pending()
+
+    if not products and not suppliers:
         _send("No pending unmatched items.")
         return
-    lines = [f"*{len(records)} pending item(s):*\n"]
-    for r in records:
-        lines.append(
-            f"`[{r['id']}]` {r['product_name']}\n"
-            f"  Invoice: {r['invoice_number']} · {r['supplier_name']}\n"
-            f"  {len(r.get('candidates', []))} candidate(s) available"
-        )
+
+    lines = []
+    if products:
+        lines.append(f"*{len(products)} unmatched product(s):*")
+        for r in products:
+            lines.append(
+                f"`[{r['id']}]` {r['product_name']}\n"
+                f"  Invoice: {r['invoice_number']} · {r['supplier_name']}\n"
+                f"  {len(r.get('candidates', []))} candidate(s)"
+            )
+
+    if suppliers:
+        if lines:
+            lines.append("")
+        lines.append(f"*{len(suppliers)} unmatched supplier(s):*")
+        for r in suppliers:
+            lines.append(
+                f"`[{r['id']}]` {r['invoice_supplier_name']}\n"
+                f"  Invoice: {r['invoice_number']}\n"
+                f"  {len(r.get('candidates', []))} candidate(s)"
+            )
+
     _send("\n".join(lines))
 
 
@@ -346,11 +462,16 @@ def run() -> None:
         if lower.startswith("link "):
             _handle_link(lower.split(), state)
         elif lower.startswith("new "):
-            # preserve original case for ingredient name
             orig_parts = text.split(None, 2)
             _handle_new([p.lower() for p in orig_parts[:2]] + ([orig_parts[2]] if len(orig_parts) > 2 else []), state)
         elif lower.startswith("skip "):
             _handle_skip(parts)
+        elif lower.startswith("newsupplier "):
+            _handle_newsupplier(parts, state)
+        elif lower.startswith("linksupplier "):
+            _handle_linksupplier(parts, state)
+        elif lower.startswith("skipsupplier "):
+            _handle_skipsupplier(parts)
         elif lower in ("/yes", "yes"):
             _handle_yes(state)
         elif lower in ("/no", "/cancel", "no", "cancel"):
@@ -363,11 +484,14 @@ def run() -> None:
         else:
             _send(
                 "Commands:\n"
-                "`link <id> <N>` — link to candidate\n"
+                "`link <id> <N>` — link product to candidate\n"
                 "`new <id> <ingredient>` — create new product\n"
-                "`skip <id>` — skip item\n"
-                "`/pending` — list unresolved items\n"
-                "`/addproduct <name> | <ingredient>` — manual entry\n"
+                "`skip <id>` — skip product\n"
+                "`newsupplier <id>` — create new supplier\n"
+                "`linksupplier <id> <N>` — link supplier to candidate\n"
+                "`skipsupplier <id>` — skip supplier\n"
+                "`/pending` — list all unresolved\n"
+                "`/addproduct <name> | <ingredient>` — manual product entry\n"
                 "`/yes` / `/no` — confirm or cancel"
             )
 

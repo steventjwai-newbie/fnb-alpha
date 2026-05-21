@@ -73,6 +73,28 @@ def notify_tier4_items(invoice: dict, tier4_records: list, file_path: str) -> bo
     return _send_seatable(text)
 
 
+def notify_missing_supplier(invoice_number: str, supplier_name: str, record_id: str, candidates: list, file_path: str) -> bool:
+    """Alert seatable_update_bot when invoice supplier isn't in Seatable."""
+    lines = [f"🏭 *Unknown supplier — {invoice_number}*\n"]
+    safe_name = supplier_name or "(no name)"
+    lines.append(f"Invoice says: `{safe_name}`")
+    if candidates:
+        lines.append("Closest matches:")
+        for i, c in enumerate(candidates[:5], 1):
+            score_pct = int(c.get("score", 0))
+            lines.append(f"  {i}\\. {c['name']} ({score_pct}%)")
+    else:
+        lines.append("_No close matches found._")
+    lines.append("")
+    lines.append(f"`newsupplier {record_id}` — create new")
+    lines.append(f"`linksupplier {record_id} <N>` — link to candidate N")
+    lines.append(f"`skipsupplier {record_id}` — skip")
+    lines.append(f"\n_File: {file_path}_")
+
+    print(f"[LOG] Sending missing supplier alert for invoice {invoice_number}")
+    return _send_seatable("\n".join(lines))
+
+
 def notify_followup_due(record: dict) -> bool:
     invoice_num = record.get("invoice_number") or "Unknown"
     supplier = record.get("supplier_name") or "Unknown supplier"
