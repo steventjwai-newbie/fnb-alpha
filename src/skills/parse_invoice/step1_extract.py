@@ -4,6 +4,7 @@ import os
 import time
 from pathlib import Path
 from typing import Optional, List, Dict, Any
+from decimal import Decimal, InvalidOperation
 from dotenv import load_dotenv
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.core.credentials import AzureKeyCredential
@@ -14,13 +15,49 @@ AZURE_DI_ENDPOINT = os.getenv("AZURE_DI_ENDPOINT")
 AZURE_DI_KEY = os.getenv("AZURE_DI_KEY")
 
 
+class DecimalEncoder(json.JSONEncoder):
+    """JSON encoder that handles Decimal values."""
+
+    def default(self, obj):
+        if isinstance(obj, Decimal):
+            return float(obj)
+        return super().default(obj)
+
+
 def extract_invoice(file_path: str) -> Dict[str, Any]:
-    """Extract invoice data from PDF using Azure Document Intelligence."""
+    """Extract invoice data from PDF or image using Azure Document Intelligence."""
     start_time = time.time()
 
     file_path_obj = Path(file_path)
     if not file_path_obj.exists():
         error_msg = f"File not found: {file_path}"
+        print(f"[LOG] Error: {error_msg}")
+        return {
+            "status": "error",
+            "file_path": file_path,
+            "error_message": error_msg,
+            "invoices": [],
+            "api_call_summary": {
+                "success": False,
+                "pages_processed": 0,
+                "invoices_extracted": 0,
+                "duration_ms": 0,
+            },
+        }
+
+    suffix = file_path_obj.suffix.lower()
+    supported_types = [
+        ".pdf",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".bmp",
+        ".tiff",
+        ".gif",
+        ".webp",
+    ]
+    if suffix not in supported_types:
+        error_msg = f"Unsupported file type: {suffix}. Supported: {', '.join(supported_types)}"
         print(f"[LOG] Error: {error_msg}")
         return {
             "status": "error",
@@ -56,6 +93,43 @@ def extract_invoice(file_path: str) -> Dict[str, Any]:
 
         invoices = _process_invoices(result)
 
+        # Gemini fallback for any invoice where all line items are missing prices
+        fallback_needed = any(_needs_gemini_fallback(inv) for inv in invoices)
+        if fallback_needed:
+            import sys as _sys
+            _here = str(Path(__file__).parent)
+            if _here not in _sys.path:
+                _sys.path.insert(0, _here)
+            from gemini_extractor import extract_invoice_gemini
+            gemini_result = extract_invoice_gemini(file_path)
+            gemini_invoices = gemini_result.get("invoices", [])
+
+            # Index Gemini invoices by invoice_number for matching
+            gemini_by_num: Dict[str, Any] = {
+                g["invoice_number"]: g
+                for g in gemini_invoices
+                if g.get("invoice_number")
+            }
+
+            for i, invoice in enumerate(invoices):
+                if _needs_gemini_fallback(invoice):
+                    azure_key = invoice.get("invoice_number") or invoice.get("do_number")
+                    gemini_match = (
+                        gemini_by_num.get(azure_key)
+                        if azure_key and azure_key in gemini_by_num
+                        else (gemini_invoices[i] if i < len(gemini_invoices) else None)
+                    )
+                    if gemini_match:
+                        invoices[i] = _merge_with_gemini(invoice, gemini_match)
+                        print(f"[LOG] Invoice {invoice.get('invoice_number', 'unknown')}: gemini_fallback")
+                    else:
+                        print(f"[LOG] Invoice {invoice.get('invoice_number', 'unknown')}: azure_di (no gemini match)")
+                else:
+                    print(f"[LOG] Invoice {invoice.get('invoice_number', 'unknown')}: azure_di")
+        else:
+            for invoice in invoices:
+                print(f"[LOG] Invoice {invoice.get('invoice_number', 'unknown')}: azure_di")
+
         print(f"[LOG] Invoices extracted: {len(invoices)}")
 
         return {
@@ -90,8 +164,21 @@ def extract_invoice(file_path: str) -> Dict[str, Any]:
         }
 
 
+def _compute_confidence(document) -> float:
+    """Compute mean confidence across all fields in document."""
+    if not hasattr(document, "fields"):
+        return 0.0
+
+    confidences = []
+    for field in document.fields.values():
+        if field and hasattr(field, "confidence") and field.confidence is not None:
+            confidences.append(field.confidence)
+
+    return sum(confidences) / len(confidences) if confidences else 0.0
+
+
 def _process_invoices(result) -> List[Dict[str, Any]]:
-    """Group documents by invoice number (primary) or DO number (fallback)."""
+    """Group documents by invoice number (primary) or DO number (fallback). Merge same invoices."""
     invoices = []
 
     if not result.documents:
@@ -114,14 +201,37 @@ def _process_invoices(result) -> List[Dict[str, Any]]:
         invoice_groups[key].append(doc)
 
     for key, documents in invoice_groups.items():
-        for doc in documents:
-            invoice_obj = _build_invoice_object(doc)
-            invoices.append(invoice_obj)
+        # Merge all documents with same invoice number into one object
+        merged_invoice = _merge_invoice_documents(documents)
+        invoices.append(merged_invoice)
 
     return invoices
 
 
-def _build_invoice_object(document) -> Dict[str, Any]:
+def _merge_invoice_documents(documents: List) -> Dict[str, Any]:
+    """Merge multiple documents with same invoice number into one invoice object."""
+    if not documents:
+        return {}
+
+    # Build from first document, then merge line items from all documents
+    first_doc = documents[0]
+    invoice_obj = _build_invoice_object(first_doc, skip_confidence=True)
+
+    # Merge line items from remaining documents
+    for doc in documents[1:]:
+        doc_items = _extract_line_items(doc)
+        invoice_obj["line_items"].extend(doc_items)
+
+    # Recompute confidence from all documents
+    all_confidences = [_compute_confidence(doc) for doc in documents]
+    invoice_obj["confidence"] = (
+        sum(all_confidences) / len(all_confidences) if all_confidences else 0.0
+    )
+
+    return invoice_obj
+
+
+def _build_invoice_object(document, skip_confidence: bool = False) -> Dict[str, Any]:
     """Build a single invoice object from Azure DI document."""
     flags: List[str] = []
 
@@ -141,14 +251,20 @@ def _build_invoice_object(document) -> Dict[str, Any]:
     if not line_items:
         flags.append("no_line_items_found")
 
-    return {
+    confidence = _compute_confidence(document) if not skip_confidence else 0.0
+
+    result = {
         "supplier_name": supplier_name,
         "invoice_number": invoice_number,
         "do_number": do_number,
         "invoice_date": invoice_date,
+        "confidence": confidence,
+        "extraction_method": "azure_di",
         "flags": flags,
         "line_items": line_items,
     }
+
+    return result
 
 
 def _extract_line_items(document) -> List[Dict[str, Any]]:
@@ -159,14 +275,30 @@ def _extract_line_items(document) -> List[Dict[str, Any]]:
         return line_items
 
     items_field = document.fields.get("Items")
-    if not items_field or not hasattr(items_field, "value") or not items_field.value:
+    if not items_field:
         return line_items
 
-    for item in items_field.value:
-        if not hasattr(item, "value"):
+    # Items are in value_array for array fields
+    items_array = None
+    if hasattr(items_field, "value_array") and items_field.value_array:
+        items_array = items_field.value_array
+    elif hasattr(items_field, "value") and items_field.value:
+        items_array = items_field.value
+
+    if not items_array:
+        return line_items
+
+    for item in items_array:
+        # Each item is a DocumentField with value_object
+        item_dict = None
+        if hasattr(item, "value_object"):
+            item_dict = item.value_object
+        elif hasattr(item, "value"):
+            item_dict = item.value
+
+        if not item_dict:
             continue
 
-        item_dict = item.value
         item_flags: List[str] = []
 
         product_name = _get_nested_field_value(item_dict, "Description")
@@ -195,12 +327,27 @@ def _extract_line_items(document) -> List[Dict[str, Any]]:
         if not product_name:
             item_flags.append("missing_product_name")
 
+        # Compute per-item confidence from Quantity, UnitPrice, Amount fields
+        item_confidences = []
+        for field_name in ["Quantity", "UnitPrice", "Amount"]:
+            if field_name in item_dict:
+                field = item_dict[field_name]
+                if hasattr(field, "confidence") and field.confidence is not None:
+                    item_confidences.append(field.confidence)
+        item_confidence = (
+            sum(item_confidences) / len(item_confidences)
+            if item_confidences
+            else 0.0
+        )
+
         line_items.append(
             {
                 "product_name": product_name,
                 "quantity": quantity,
+                "unit": None,
                 "unit_price": unit_price,
                 "total_price": total_price,
+                "confidence": item_confidence,
                 "flags": item_flags,
             }
         )
@@ -214,11 +361,23 @@ def _get_field_value(document, field_name: str) -> Optional[str]:
         return None
 
     field = document.fields.get(field_name)
-    if not field or not hasattr(field, "value"):
+    if not field:
         return None
 
-    value = field.value
-    return str(value).strip() if value else None
+    # Handle different field value types
+    if hasattr(field, "value_string") and field.value_string is not None:
+        return str(field.value_string).strip()
+    elif hasattr(field, "value_date") and field.value_date is not None:
+        return str(field.value_date)
+    elif hasattr(field, "value_currency") and field.value_currency is not None:
+        if hasattr(field.value_currency, "amount"):
+            return str(field.value_currency.amount)
+        return str(field.value_currency)
+    elif hasattr(field, "value") and field.value is not None:
+        val = field.value
+        return str(val).strip() if isinstance(val, str) else str(val)
+
+    return None
 
 
 def _get_nested_field_value(
@@ -229,34 +388,135 @@ def _get_nested_field_value(
         return None
 
     field = item_dict[field_name]
-    if not field or not hasattr(field, "value"):
+    if not field:
         return None
 
-    value = field.value
-    return str(value).strip() if value else None
+    # Handle different field value types
+    if hasattr(field, "value_string"):
+        return str(field.value_string).strip() if field.value_string else None
+    elif hasattr(field, "value_number"):
+        return str(field.value_number) if field.value_number else None
+    elif hasattr(field, "value_date"):
+        return str(field.value_date).strip() if field.value_date else None
+    elif hasattr(field, "value_currency"):
+        if hasattr(field.value_currency, "amount"):
+            return str(field.value_currency.amount)
+        return str(field.value_currency)
+    elif hasattr(field, "value"):
+        value = field.value
+        return str(value).strip() if isinstance(value, str) else str(value) if value else None
+
+    return None
 
 
-def _parse_number(value: Optional[str]) -> Optional[float]:
-    """Parse a string to float, return None if invalid."""
+def _parse_number(value: Optional[str]) -> Optional[Decimal]:
+    """Parse a string to Decimal, return None if invalid."""
     if not value:
         return None
 
     try:
-        return float(value)
-    except (ValueError, TypeError):
+        return Decimal(value)
+    except (InvalidOperation, ValueError, TypeError):
         return None
 
 
+def _needs_gemini_fallback(invoice: Dict[str, Any]) -> bool:
+    """True when every line item is missing all three numeric fields."""
+    items = invoice.get("line_items", [])
+    if not items:
+        return True
+    return all(
+        item.get("quantity") is None
+        and item.get("unit_price") is None
+        and item.get("total_price") is None
+        for item in items
+    )
+
+
+def _merge_with_gemini(azure_invoice: Dict[str, Any], gemini_invoice: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep Azure header fields where present; replace line items with Gemini's."""
+    merged = {
+        "supplier_name": azure_invoice.get("supplier_name") or gemini_invoice.get("supplier_name"),
+        "invoice_number": azure_invoice.get("invoice_number") or gemini_invoice.get("invoice_number"),
+        "do_number": azure_invoice.get("do_number") or gemini_invoice.get("do_number"),
+        "invoice_date": azure_invoice.get("invoice_date") or gemini_invoice.get("invoice_date"),
+        "confidence": azure_invoice.get("confidence"),
+        "extraction_method": "gemini_fallback",
+        "line_items": gemini_invoice.get("line_items", []),
+    }
+
+    flags: List[str] = []
+    if not merged["supplier_name"]:
+        flags.append("missing_supplier_name")
+    if not merged["invoice_number"]:
+        flags.append("missing_invoice_number")
+    if not merged["invoice_date"]:
+        flags.append("missing_invoice_date")
+    if not merged["line_items"]:
+        flags.append("no_line_items_found")
+    merged["flags"] = flags
+
+    return merged
+
+
+def debug_azure_fields(file_path: str):
+    """Debug: dump all fields returned by Azure DI."""
+    try:
+        client = DocumentIntelligenceClient(
+            endpoint=AZURE_DI_ENDPOINT, credential=AzureKeyCredential(AZURE_DI_KEY)
+        )
+
+        with open(file_path, "rb") as f:
+            file_data = f.read()
+
+        poller = client.begin_analyze_document("prebuilt-invoice", file_data)
+        result = poller.result()
+
+        print("[DEBUG] Full Azure Response:")
+        print(f"  Documents count: {len(result.documents) if result.documents else 0}")
+        print(f"  Pages count: {len(result.pages) if result.pages else 0}")
+
+        if result.documents:
+            doc = result.documents[0]
+            print("\n[DEBUG] Fields:")
+            if hasattr(doc, "fields"):
+                for field_name, field_obj in doc.fields.items():
+                    if hasattr(field_obj, "value"):
+                        print(f"  {field_name}: {field_obj.value}")
+                    else:
+                        print(f"  {field_name}: {field_obj}")
+                print("\n[DEBUG] Items field details:")
+                items = doc.fields.get("Items")
+                if items and hasattr(items, "value"):
+                    print(f"  Items type: {type(items.value)}")
+                    if items.value:
+                        print(f"  Items count: {len(items.value)}")
+                        for idx, item in enumerate(items.value):
+                            print(f"    Item {idx}: {item}")
+                    else:
+                        print("  Items: empty/None")
+            else:
+                print("  No fields attribute")
+
+    except Exception as e:
+        import traceback
+        print(f"[DEBUG] Error: {e}")
+        traceback.print_exc()
+
+
 def main():
-    """CLI entry point. Usage: python step1_extract.py <invoice_pdf_path>"""
+    """CLI entry point. Usage: python step1_extract.py <invoice_pdf_path> [--debug]"""
     if len(sys.argv) < 2:
-        print("Usage: python step1_extract.py <invoice_pdf_path>")
+        print("Usage: python step1_extract.py <invoice_pdf_path> [--debug]")
         sys.exit(1)
 
     file_path = sys.argv[1]
-    result = extract_invoice(file_path)
 
-    print(json.dumps(result, indent=2))
+    if "--debug" in sys.argv:
+        debug_azure_fields(file_path)
+    else:
+        result = extract_invoice(file_path)
+        print(json.dumps(result, indent=2, cls=DecimalEncoder))
 
 
 if __name__ == "__main__":
