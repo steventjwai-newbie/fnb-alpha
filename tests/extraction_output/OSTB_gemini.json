@@ -1,0 +1,46 @@
+﻿[LOG] Calling Gemini fallback for: tests/sample_invoices/OSTB_4781403854y52k20829V2gA65.pdf
+[LOG] Gemini extraction successful. Duration: 8977ms, Invoices: 1
+{
+  "status": "success",
+  "file_path": "tests/sample_invoices/OSTB_4781403854y52k20829V2gA65.pdf",
+  "error_message": null,
+  "invoices": [
+    {
+      "supplier_name": "\u52d2\u987f\u7cbe\u54c1\u5496\u5561",
+      "invoice_number": "MY091472026051100013886",
+      "do_number": null,
+      "invoice_date": "2026-05-11",
+      "confidence": null,
+      "extraction_method": "gemini_fallback",
+      "flags": [],
+      "line_items": [
+        {
+          "product_name": "laputa\u52d2\u987f\u5496\u5561\u6cb9\u8102\u8fc7\u6ee4\u676f \u610f\u5f0f\u6d53\u7f29\u4e0d\u9508\u94a2\u8d85\u8403\u53d6\u676f\u82b1 \u5f0f\u6ee4\u6cb9\u8102\u795e\u5668",
+          "quantity": 1.0,
+          "unit": null,
+          "unit_price": 30.6,
+          "total_price": 33.66,
+          "confidence": null,
+          "flags": []
+        },
+        {
+          "product_name": "Shipping Fee",
+          "quantity": null,
+          "unit": null,
+          "unit_price": 0.0,
+          "total_price": 0.0,
+          "confidence": null,
+          "flags": [
+            "missing_quantity"
+          ]
+        }
+      ]
+    }
+  ],
+  "api_call_summary": {
+    "success": true,
+    "pages_processed": 1,
+    "invoices_extracted": 1,
+    "duration_ms": 8977
+  }
+}

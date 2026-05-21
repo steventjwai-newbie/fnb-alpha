@@ -1,9 +1,5 @@
-﻿[LOG] Calling Azure Document Intelligence for: tests/sample_invoices/WhatsApp Image 2026-05-11 at 12.56.59.jpeg
-[LOG] Azure DI call successful. Duration: 8010ms, Pages: 1
-[LOG] Calling Gemini fallback for: tests/sample_invoices/WhatsApp Image 2026-05-11 at 12.56.59.jpeg
-[LOG] Gemini extraction successful. Duration: 7940ms, Invoices: 1
-[LOG] Invoice CINV-1256-0526: gemini_fallback
-[LOG] Invoices extracted: 1
+﻿[LOG] Calling Gemini fallback for: tests/sample_invoices/WhatsApp Image 2026-05-11 at 12.56.59.jpeg
+[LOG] Gemini extraction successful. Duration: 5504ms, Invoices: 1
 {
   "status": "success",
   "file_path": "tests/sample_invoices/WhatsApp Image 2026-05-11 at 12.56.59.jpeg",
@@ -14,8 +10,9 @@
       "invoice_number": "CINV-1256-0526",
       "do_number": "DO-1803-0526",
       "invoice_date": "2026-05-08",
-      "confidence": 0.8808571428571429,
+      "confidence": null,
       "extraction_method": "gemini_fallback",
+      "flags": [],
       "line_items": [
         {
           "product_name": "FROZEN SMOKED SALMON TROUT FILLET 1KG (10KG/CTN)",
@@ -26,14 +23,13 @@
           "confidence": null,
           "flags": []
         }
-      ],
-      "flags": []
+      ]
     }
   ],
   "api_call_summary": {
     "success": true,
     "pages_processed": 1,
     "invoices_extracted": 1,
-    "duration_ms": 8010
+    "duration_ms": 5504
   }
 }

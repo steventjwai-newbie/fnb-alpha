@@ -25,7 +25,27 @@ class DecimalEncoder(json.JSONEncoder):
 
 
 def extract_invoice(file_path: str) -> Dict[str, Any]:
-    """Extract invoice data from PDF or image using Azure Document Intelligence."""
+    """Extract invoice data from PDF or image. Currently routes to Gemini only."""
+    import sys as _sys
+    _here = str(Path(__file__).parent)
+    if _here not in _sys.path:
+        _sys.path.insert(0, _here)
+    from gemini_extractor import extract_invoice_gemini
+    from notifier import notify_handwriting_detected
+    from followup_store import add_followup
+
+    result = extract_invoice_gemini(file_path)
+
+    for invoice in result.get("invoices", []):
+        if invoice.get("has_handwriting"):
+            notify_handwriting_detected(invoice, file_path)
+            add_followup(invoice, file_path)
+
+    return result
+
+
+def _extract_invoice_azure(file_path: str) -> Dict[str, Any]:
+    """Azure DI extraction — kept for reference, not active."""
     start_time = time.time()
 
     file_path_obj = Path(file_path)

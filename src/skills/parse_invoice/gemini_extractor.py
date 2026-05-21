@@ -27,6 +27,8 @@ SYSTEM_PROMPT = (
     '      "invoice_number": "string or null",\n'
     '      "do_number": "string or null",\n'
     '      "invoice_date": "YYYY-MM-DD or null",\n'
+    '      "has_handwriting": true or false,\n'
+    '      "handwriting_content": "verbatim transcription of all handwritten text, or null if none",\n'
     '      "line_items": [\n'
     '        {\n'
     '          "product_name": "string or null",\n'
@@ -44,6 +46,8 @@ SYSTEM_PROMPT = (
     "- For dates use YYYY-MM-DD.\n"
     "- For numbers use numeric values, not strings.\n"
     "- If a field is missing or unreadable use null.\n"
+    "- has_handwriting must be true if ANY handwritten text appears anywhere on the document.\n"
+    "- handwriting_content must transcribe handwritten notes and annotations only — exclude signatures, company names, company registration numbers, and rubber stamps.\n"
     "- Return ONLY the JSON object."
 )
 
@@ -134,6 +138,8 @@ def _parse_invoices(raw_invoices: list) -> List[Dict[str, Any]]:
         invoice_number = inv.get("invoice_number") or None
         do_number = inv.get("do_number") or None
         invoice_date = inv.get("invoice_date") or None
+        has_handwriting = bool(inv.get("has_handwriting", False))
+        handwriting_content = inv.get("handwriting_content") or None
 
         if not supplier_name:
             flags.append("missing_supplier_name")
@@ -141,6 +147,8 @@ def _parse_invoices(raw_invoices: list) -> List[Dict[str, Any]]:
             flags.append("missing_invoice_number")
         if not invoice_date:
             flags.append("missing_invoice_date")
+        if has_handwriting:
+            flags.append("handwriting_detected")
 
         line_items = _parse_line_items(inv.get("line_items", []))
         if not line_items:
@@ -152,6 +160,8 @@ def _parse_invoices(raw_invoices: list) -> List[Dict[str, Any]]:
                 "invoice_number": invoice_number,
                 "do_number": do_number,
                 "invoice_date": invoice_date,
+                "has_handwriting": has_handwriting,
+                "handwriting_content": handwriting_content,
                 "confidence": None,
                 "extraction_method": "gemini_fallback",
                 "flags": flags,

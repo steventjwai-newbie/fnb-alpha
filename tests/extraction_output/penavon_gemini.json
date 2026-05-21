@@ -1,0 +1,35 @@
+﻿[LOG] Calling Gemini fallback for: tests/sample_invoices/WhatsApp Image 2026-05-20 at 12.14.42.jpeg
+[LOG] Gemini extraction successful. Duration: 5948ms, Invoices: 1
+{
+  "status": "success",
+  "file_path": "tests/sample_invoices/WhatsApp Image 2026-05-20 at 12.14.42.jpeg",
+  "error_message": null,
+  "invoices": [
+    {
+      "supplier_name": "PENAVON FOOD MARKETING SDN BHD",
+      "invoice_number": "IV-108683",
+      "do_number": null,
+      "invoice_date": "2025-05-07",
+      "confidence": null,
+      "extraction_method": "gemini_fallback",
+      "flags": [],
+      "line_items": [
+        {
+          "product_name": "Kara Barista Coconut Milk (6 x 1L)",
+          "quantity": 6.0,
+          "unit": "UNIT",
+          "unit_price": 9.35,
+          "total_price": 56.1,
+          "confidence": null,
+          "flags": []
+        }
+      ]
+    }
+  ],
+  "api_call_summary": {
+    "success": true,
+    "pages_processed": 1,
+    "invoices_extracted": 1,
+    "duration_ms": 5948
+  }
+}
