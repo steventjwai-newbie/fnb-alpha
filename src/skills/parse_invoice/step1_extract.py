@@ -32,14 +32,12 @@ def extract_invoice(file_path: str) -> Dict[str, Any]:
         _sys.path.insert(0, _here)
     from gemini_extractor import extract_invoice_gemini
     from notifier import notify_handwriting_detected
-    from followup_store import add_followup
 
     result = extract_invoice_gemini(file_path)
 
     for invoice in result.get("invoices", []):
         if invoice.get("has_handwriting"):
             notify_handwriting_detected(invoice, file_path)
-            add_followup(invoice, file_path)
 
     return result
 

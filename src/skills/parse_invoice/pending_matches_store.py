@@ -32,6 +32,10 @@ def add_pending_item(
     candidates: List[Dict[str, Any]],  # [{name, id, score}]
 ) -> str:
     records = _load()
+    # Dedup: return existing id if same invoice + product is already pending
+    for r in records:
+        if r["invoice_number"] == invoice_number and r["product_name"] == product_name and r["status"] == "pending":
+            return r["id"]
     record_id = str(uuid.uuid4())[:8]
     records.append(
         {

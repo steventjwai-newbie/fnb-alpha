@@ -1,16 +1,19 @@
 """
 Telegram bot listener for seatable_update_bot.
-Polls for user replies to Tier-4 unmatched items and handles:
 
+Each confirmation request sends a message; user replies to THAT message with
+/yes or /no, so multiple pending actions can coexist without conflict.
+
+Commands:
   link <id> <N>                       — link product to fuzzy candidate N
   new <id> <ingredient>               — create new Supplier Product row
   skip <id>                           — dismiss product match
   newsupplier <id>                    — create new Supplier row
   linksupplier <id> <N>               — link invoice supplier to candidate N
   skipsupplier <id>                   — dismiss supplier match
-  /yes                                — confirm pending action
-  /no  or  /cancel                    — cancel pending action
-  /pending                            — list all unresolved items (products + suppliers)
+  /yes  (reply to confirm message)    — confirm that specific action
+  /no   (reply to confirm message)    — cancel that specific action
+  /pending                            — list all unresolved items
   /addproduct <name> | <ingredient>   — manual product creation
 
 Run via Windows Task Scheduler every 5 minutes:
@@ -33,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).parent / "parse_invoice"))
 
 from pending_matches_store import get_by_id, get_all_pending, resolve
 import pending_suppliers_store as _sup_store
+from unit_normalizer import get_base_unit_info
 
 _BOT_TOKEN = os.getenv("SEATABLE_BOT_TOKEN")
 _CHAT_ID = os.getenv("SEATABLE_BOT_CHAT_ID", "-5150446443")
@@ -47,8 +51,16 @@ _STATE_PATH = Path(__file__).parent.parent.parent / "data" / "bot_state.json"
 def _load_state() -> Dict[str, Any]:
     if _STATE_PATH.exists():
         with open(_STATE_PATH, encoding="utf-8-sig") as f:
-            return json.load(f)
-    return {"last_update_id": 0, "pending_confirmation": None}
+            state = json.load(f)
+        # Migrate old single pending_confirmation to new dict format
+        if "pending_confirmation" in state and "pending_confirmations" not in state:
+            old = state.pop("pending_confirmation")
+            state["pending_confirmations"] = {}
+            if old:
+                state["pending_confirmations"]["0"] = old
+        state.setdefault("pending_confirmations", {})
+        return state
+    return {"last_update_id": 0, "pending_confirmations": {}}
 
 
 def _save_state(state: Dict[str, Any]) -> None:
@@ -59,9 +71,14 @@ def _save_state(state: Dict[str, Any]) -> None:
 
 # ── Telegram helpers ────────────────────────────────────────────────────────────
 
-def _send(text: str) -> None:
+def _send(text: str) -> Optional[int]:
+    """Send message, return message_id or None on failure."""
     url = f"https://api.telegram.org/bot{_BOT_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": _CHAT_ID, "text": text, "parse_mode": "Markdown"})
+    resp = requests.post(url, json={"chat_id": _CHAT_ID, "text": text, "parse_mode": "Markdown"})
+    if not resp.ok:
+        print(f"[LOG] Telegram error: {resp.status_code} {resp.text[:100]}")
+        return None
+    return resp.json().get("result", {}).get("message_id")
 
 
 def _get_updates(offset: int) -> list:
@@ -85,11 +102,9 @@ def _find_ingredient_id(base: Base, ingredient_name: str) -> Optional[Dict[str, 
     rows = base.list_rows("Ingredients")
     names = [r.get("Ingredient Name", "") for r in rows]
     results = process.extract(ingredient_name, names, scorer=fuzz.token_sort_ratio, limit=1)
-    if not results:
+    if not results or results[0][1] < 60:
         return None
     best_name, score, idx = results[0]
-    if score < 60:
-        return None
     return {"name": best_name, "id": rows[idx].get("_id", "")}
 
 
@@ -97,37 +112,42 @@ def _find_supplier_id(base: Base, supplier_name: str) -> Optional[Dict[str, str]
     rows = base.list_rows("Suppliers")
     names = [r.get("Supplier Name", "") for r in rows]
     results = process.extract(supplier_name, names, scorer=fuzz.token_sort_ratio, limit=1)
-    if not results:
+    if not results or results[0][1] < 60:
         return None
     best_name, score, idx = results[0]
-    if score < 60:
-        return None
     return {"name": best_name, "id": rows[idx].get("_id", "")}
 
 
-def _create_supplier_product(record: Dict[str, Any], ingredient_name: str) -> Dict[str, Any]:
+def _create_supplier_product(conf: Dict[str, Any], ingredient_name: str) -> Dict[str, Any]:
     base = _seatable_base()
-
     ingredient = _find_ingredient_id(base, ingredient_name)
-    supplier = _find_supplier_id(base, record.get("supplier_name", ""))
+    supplier = _find_supplier_id(base, conf.get("supplier_name") or "")
 
-    row_data: Dict[str, Any] = {
-        "Supplier Product Name": record["product_name"],
-        "Active Status": "Active",
-    }
-    if record.get("unit_price") is not None:
-        row_data["Price per Pack"] = record["unit_price"]
-    if record.get("unit"):
-        row_data["Unit of Measure"] = record["unit"]
+    row_data: Dict[str, Any] = {"Supplier Product Name": conf["product_name"], "Active Status": "Active"}
+    unit = conf.get("unit") or ""
+    unit_price = conf.get("unit_price")
+    unit_info = get_base_unit_info(unit) if unit else None
+
+    if unit_info and unit_price is not None:
+        divisor, base_uom = unit_info
+        unit_qty = int(divisor)
+        price_per_pack = float(unit_price)
+        row_data["Price per Pack"] = price_per_pack
+        row_data["Unit Quantity"] = unit_qty
+        row_data["Unit of Measure"] = base_uom
+    elif unit_price is not None:
+        row_data["Price per Pack"] = float(unit_price)
+        row_data["Unit of Measure"] = unit
+        print(f"[LOG] Unknown unit '{unit}' — stored raw, Unit Quantity not set")
 
     new_row = base.append_row("Supplier Products", row_data)
     new_id = new_row.get("_id", "")
 
     if new_id:
         meta = base.get_metadata()
-        tables = {t["name"]: t for t in meta.get("tables", [])}
-        sp_table = tables.get("Supplier Products", {})
-        cols = {c["name"]: c for c in sp_table.get("columns", [])}
+        cols = {c["name"]: c for c in next(
+            (t for t in meta.get("tables", []) if t["name"] == "Supplier Products"), {}
+        ).get("columns", [])}
 
         if supplier and "Supplier" in cols:
             try:
@@ -141,6 +161,24 @@ def _create_supplier_product(record: Dict[str, Any], ingredient_name: str) -> Di
             except Exception as e:
                 print(f"[LOG] Ingredient link failed: {e}")
 
+        ph_row = base.append_row("Price History", {
+            "Old Price": 0.0,
+            "New Price": row_data.get("Price per Pack", 0.0),
+            "Change %": None,
+            "Invoice Reference": conf.get("invoice_number") or "",
+            "Flagged By": "New product",
+        })
+        ph_row_id = ph_row.get("_id", "")
+        if ph_row_id:
+            ph_cols = {c["name"]: c for c in next(
+                (t for t in meta.get("tables", []) if t["name"] == "Price History"), {}
+            ).get("columns", [])}
+            if "Supplier product" in ph_cols:
+                try:
+                    base.add_link(ph_cols["Supplier product"]["key"], "Price History", "Supplier Products", ph_row_id, new_id)
+                except Exception as e:
+                    print(f"[LOG] Price History link failed: {e}")
+
     return {
         "new_id": new_id,
         "ingredient_matched": ingredient["name"] if ingredient else None,
@@ -151,15 +189,13 @@ def _create_supplier_product(record: Dict[str, Any], ingredient_name: str) -> Di
 # ── Command handlers ────────────────────────────────────────────────────────────
 
 def _handle_link(parts: list, state: Dict[str, Any]) -> None:
-    # link <record_id> <N>
     if len(parts) < 3:
         _send("Usage: `link <id> <candidate number>`")
         return
     record_id, num_str = parts[1], parts[2]
     if not num_str.isdigit():
-        _send("Candidate number must be a digit, e.g. `link abc12345 2`")
+        _send("Candidate number must be a digit.")
         return
-    num = int(num_str)
 
     record = get_by_id(record_id)
     if not record:
@@ -170,26 +206,27 @@ def _handle_link(parts: list, state: Dict[str, Any]) -> None:
         return
 
     candidates = record.get("candidates", [])
+    num = int(num_str)
     if num < 1 or num > len(candidates):
         _send(f"Candidate {num} out of range (1–{len(candidates)}).")
         return
 
     chosen = candidates[num - 1]
-    state["pending_confirmation"] = {
-        "action": "link",
-        "record_id": record_id,
-        "product_name": record["product_name"],
-        "matched_product_name": chosen["name"],
-        "matched_product_id": chosen["id"],
-    }
-    _send(
+    msg_id = _send(
         f"Confirm: link *{record['product_name']}* → *{chosen['name']}*?\n"
-        f"Reply `/yes` to confirm or `/no` to cancel."
+        f"Reply `/yes` to this message to confirm, or `/no` to cancel."
     )
+    if msg_id:
+        state["pending_confirmations"][str(msg_id)] = {
+            "action": "link",
+            "record_id": record_id,
+            "product_name": record["product_name"],
+            "matched_product_name": chosen["name"],
+            "matched_product_id": chosen["id"],
+        }
 
 
 def _handle_new(parts: list, state: Dict[str, Any]) -> None:
-    # new <record_id> <ingredient name...>
     if len(parts) < 3:
         _send("Usage: `new <id> <ingredient name>`")
         return
@@ -204,47 +241,154 @@ def _handle_new(parts: list, state: Dict[str, Any]) -> None:
         _send(f"`{record_id}` is already resolved ({record['status']}).")
         return
 
-    state["pending_confirmation"] = {
-        "action": "new",
-        "record_id": record_id,
-        "product_name": record["product_name"],
-        "ingredient_name": ingredient_name,
-        "unit_price": record.get("unit_price"),
-        "unit": record.get("unit"),
-        "supplier_name": record.get("supplier_name"),
-    }
     price_str = f"RM{record.get('unit_price')}" if record.get("unit_price") else "no price"
-    _send(
+    msg_id = _send(
         f"Confirm: create new Supplier Product\n"
         f"  Name: *{record['product_name']}*\n"
         f"  Ingredient: *{ingredient_name}*\n"
         f"  Supplier: {record.get('supplier_name') or 'unknown'}\n"
         f"  Price: {price_str}\n"
-        f"Reply `/yes` to create or `/no` to cancel."
+        f"Reply `/yes` to this message to confirm, or `/no` to cancel."
     )
+    if msg_id:
+        state["pending_confirmations"][str(msg_id)] = {
+            "action": "new",
+            "record_id": record_id,
+            "product_name": record["product_name"],
+            "ingredient_name": ingredient_name,
+            "unit_price": record.get("unit_price"),
+            "unit": record.get("unit"),
+            "supplier_name": record.get("supplier_name"),
+        }
 
 
 def _handle_skip(parts: list) -> None:
     if len(parts) < 2:
         _send("Usage: `skip <id>`")
         return
-    record_id = parts[1]
-    record = get_by_id(record_id)
+    record = get_by_id(parts[1])
     if not record:
-        _send(f"No pending item with id `{record_id}`.")
+        _send(f"No pending item with id `{parts[1]}`.")
         return
-    resolve(record_id, {"type": "skipped"})
-    _send(f"Skipped `{record['product_name']}` ({record_id}).")
+    resolve(parts[1], {"type": "skipped"})
+    _send(f"Skipped `{record['product_name']}`.")
 
 
-def _handle_yes(state: Dict[str, Any]) -> None:
-    conf = state.get("pending_confirmation")
-    if not conf:
-        _send("No pending action to confirm.")
+def _handle_newsupplier(parts: list, state: Dict[str, Any]) -> None:
+    if len(parts) < 2:
+        _send("Usage: `newsupplier <id>`")
+        return
+    record = _sup_store.get_by_id(parts[1])
+    if not record:
+        _send(f"No pending supplier with id `{parts[1]}`.")
+        return
+    if record["status"] != "pending":
+        _send(f"`{parts[1]}` is already resolved ({record['status']}).")
+        return
+
+    msg_id = _send(
+        f"Confirm: create new supplier *{record['invoice_supplier_name']}*?\n"
+        f"Reply `/yes` to this message to confirm, or `/no` to cancel."
+    )
+    if msg_id:
+        state["pending_confirmations"][str(msg_id)] = {
+            "action": "newsupplier",
+            "record_id": parts[1],
+            "supplier_name": record["invoice_supplier_name"],
+        }
+
+
+def _handle_linksupplier(parts: list, state: Dict[str, Any]) -> None:
+    if len(parts) < 3:
+        _send("Usage: `linksupplier <id> <N>`")
+        return
+    record_id, num_str = parts[1], parts[2]
+    if not num_str.isdigit():
+        _send("Candidate number must be a digit.")
+        return
+
+    record = _sup_store.get_by_id(record_id)
+    if not record:
+        _send(f"No pending supplier with id `{record_id}`.")
+        return
+    if record["status"] != "pending":
+        _send(f"`{record_id}` is already resolved ({record['status']}).")
+        return
+
+    candidates = record.get("candidates", [])
+    num = int(num_str)
+    if num < 1 or num > len(candidates):
+        _send(f"Candidate {num} out of range (1–{len(candidates)}).")
+        return
+
+    chosen = candidates[num - 1]
+    msg_id = _send(
+        f"Confirm: *{record['invoice_supplier_name']}* → *{chosen['name']}*?\n"
+        f"Reply `/yes` to this message to confirm, or `/no` to cancel."
+    )
+    if msg_id:
+        state["pending_confirmations"][str(msg_id)] = {
+            "action": "linksupplier",
+            "record_id": record_id,
+            "invoice_supplier_name": record["invoice_supplier_name"],
+            "matched_supplier_name": chosen["name"],
+            "matched_supplier_id": chosen["id"],
+        }
+
+
+def _handle_skipsupplier(parts: list) -> None:
+    if len(parts) < 2:
+        _send("Usage: `skipsupplier <id>`")
+        return
+    record = _sup_store.get_by_id(parts[1])
+    if not record:
+        _send(f"No pending supplier with id `{parts[1]}`.")
+        return
+    _sup_store.resolve(parts[1], {"type": "skipped"})
+    _send(f"Skipped supplier `{record['invoice_supplier_name']}`.")
+
+
+def _handle_addproduct(text: str, state: Dict[str, Any]) -> None:
+    body = text[len("/addproduct"):].strip()
+    if "|" not in body:
+        _send("Usage: `/addproduct <product name> | <ingredient name>`")
+        return
+    name, ingredient = [p.strip() for p in body.split("|", 1)]
+    if not name or not ingredient:
+        _send("Both product name and ingredient name are required.")
+        return
+
+    msg_id = _send(
+        f"Confirm: create new Supplier Product\n"
+        f"  Name: *{name}*\n"
+        f"  Ingredient: *{ingredient}*\n"
+        f"Reply `/yes` to this message to confirm, or `/no` to cancel."
+    )
+    if msg_id:
+        state["pending_confirmations"][str(msg_id)] = {
+            "action": "addproduct",
+            "product_name": name,
+            "ingredient_name": ingredient,
+            "supplier_name": None,
+            "unit_price": None,
+            "unit": None,
+        }
+
+
+def _handle_yes(state: Dict[str, Any], reply_msg_id: str) -> None:
+    confs = state.get("pending_confirmations", {})
+
+    # Prefer the message the user replied to; fall back to most recent
+    if reply_msg_id and reply_msg_id in confs:
+        conf = confs.pop(reply_msg_id)
+    elif confs:
+        key = list(confs.keys())[-1]
+        conf = confs.pop(key)
+    else:
+        _send("No pending action to confirm. Reply `/yes` directly to a confirmation message.")
         return
 
     action = conf["action"]
-    state["pending_confirmation"] = None
 
     if action == "link":
         resolve(conf["record_id"], {
@@ -254,28 +398,17 @@ def _handle_yes(state: Dict[str, Any]) -> None:
         })
         _send(f"✅ Linked *{conf['product_name']}* → *{conf['matched_product_name']}*.")
 
-    elif action == "new":
+    elif action in ("new", "addproduct"):
         _send("Creating new Supplier Product in Seatable...")
         try:
             result = _create_supplier_product(conf, conf["ingredient_name"])
-            resolve(conf["record_id"], {
-                "type": "created",
-                "new_product_id": result["new_id"],
-                "ingredient_matched": result["ingredient_matched"],
-                "supplier_matched": result["supplier_matched"],
-            })
-            _send(
-                f"✅ Created *{conf['product_name']}*\n"
-                f"  Ingredient: {result['ingredient_matched'] or '⚠️ not matched'}\n"
-                f"  Supplier: {result['supplier_matched'] or '⚠️ not matched'}"
-            )
-        except Exception as e:
-            _send(f"❌ Failed to create product: {e}")
-
-    elif action == "addproduct":
-        _send("Creating new Supplier Product in Seatable...")
-        try:
-            result = _create_supplier_product(conf, conf["ingredient_name"])
+            if action == "new":
+                resolve(conf["record_id"], {
+                    "type": "created",
+                    "new_product_id": result["new_id"],
+                    "ingredient_matched": result["ingredient_matched"],
+                    "supplier_matched": result["supplier_matched"],
+                })
             _send(
                 f"✅ Created *{conf['product_name']}*\n"
                 f"  Ingredient: {result['ingredient_matched'] or '⚠️ not matched'}\n"
@@ -304,107 +437,17 @@ def _handle_yes(state: Dict[str, Any]) -> None:
         _send(f"✅ Linked *{conf['invoice_supplier_name']}* → *{conf['matched_supplier_name']}*.")
 
 
-def _handle_addproduct(text: str, state: Dict[str, Any]) -> None:
-    # /addproduct <name> | <ingredient>
-    body = text[len("/addproduct"):].strip()
-    if "|" not in body:
-        _send("Usage: `/addproduct <product name> | <ingredient name>`")
-        return
-    name, ingredient = [p.strip() for p in body.split("|", 1)]
-    if not name or not ingredient:
-        _send("Both product name and ingredient name are required.")
-        return
-
-    state["pending_confirmation"] = {
-        "action": "addproduct",
-        "product_name": name,
-        "ingredient_name": ingredient,
-        "supplier_name": None,
-        "unit_price": None,
-        "unit": None,
-    }
-    _send(
-        f"Confirm: create new Supplier Product\n"
-        f"  Name: *{name}*\n"
-        f"  Ingredient: *{ingredient}*\n"
-        f"Reply `/yes` to create or `/no` to cancel."
-    )
-
-
-def _handle_newsupplier(parts: list, state: Dict[str, Any]) -> None:
-    # newsupplier <record_id>
-    if len(parts) < 2:
-        _send("Usage: `newsupplier <id>`")
-        return
-    record_id = parts[1]
-    record = _sup_store.get_by_id(record_id)
-    if not record:
-        _send(f"No pending supplier with id `{record_id}`.")
-        return
-    if record["status"] != "pending":
-        _send(f"`{record_id}` is already resolved ({record['status']}).")
-        return
-
-    state["pending_confirmation"] = {
-        "action": "newsupplier",
-        "record_id": record_id,
-        "supplier_name": record["invoice_supplier_name"],
-    }
-    _send(
-        f"Confirm: create new supplier *{record['invoice_supplier_name']}*?\n"
-        f"Reply `/yes` to confirm or `/no` to cancel."
-    )
-
-
-def _handle_linksupplier(parts: list, state: Dict[str, Any]) -> None:
-    # linksupplier <record_id> <N>
-    if len(parts) < 3:
-        _send("Usage: `linksupplier <id> <candidate number>`")
-        return
-    record_id, num_str = parts[1], parts[2]
-    if not num_str.isdigit():
-        _send("Candidate number must be a digit, e.g. `linksupplier abc12345 2`")
-        return
-    num = int(num_str)
-
-    record = _sup_store.get_by_id(record_id)
-    if not record:
-        _send(f"No pending supplier with id `{record_id}`.")
-        return
-    if record["status"] != "pending":
-        _send(f"`{record_id}` is already resolved ({record['status']}).")
-        return
-
-    candidates = record.get("candidates", [])
-    if num < 1 or num > len(candidates):
-        _send(f"Candidate {num} out of range (1–{len(candidates)}).")
-        return
-
-    chosen = candidates[num - 1]
-    state["pending_confirmation"] = {
-        "action": "linksupplier",
-        "record_id": record_id,
-        "invoice_supplier_name": record["invoice_supplier_name"],
-        "matched_supplier_name": chosen["name"],
-        "matched_supplier_id": chosen["id"],
-    }
-    _send(
-        f"Confirm: *{record['invoice_supplier_name']}* → *{chosen['name']}*?\n"
-        f"Reply `/yes` to confirm or `/no` to cancel."
-    )
-
-
-def _handle_skipsupplier(parts: list) -> None:
-    if len(parts) < 2:
-        _send("Usage: `skipsupplier <id>`")
-        return
-    record_id = parts[1]
-    record = _sup_store.get_by_id(record_id)
-    if not record:
-        _send(f"No pending supplier with id `{record_id}`.")
-        return
-    _sup_store.resolve(record_id, {"type": "skipped"})
-    _send(f"Skipped supplier `{record['invoice_supplier_name']}` ({record_id}).")
+def _handle_no(state: Dict[str, Any], reply_msg_id: str) -> None:
+    confs = state.get("pending_confirmations", {})
+    if reply_msg_id and reply_msg_id in confs:
+        confs.pop(reply_msg_id)
+        _send("Cancelled.")
+    elif confs:
+        key = list(confs.keys())[-1]
+        confs.pop(key)
+        _send("Cancelled.")
+    else:
+        _send("Nothing to cancel.")
 
 
 def _handle_pending() -> None:
@@ -424,7 +467,6 @@ def _handle_pending() -> None:
                 f"  Invoice: {r['invoice_number']} · {r['supplier_name']}\n"
                 f"  {len(r.get('candidates', []))} candidate(s)"
             )
-
     if suppliers:
         if lines:
             lines.append("")
@@ -435,10 +477,22 @@ def _handle_pending() -> None:
                 f"  Invoice: {r['invoice_number']}\n"
                 f"  {len(r.get('candidates', []))} candidate(s)"
             )
-
     _send("\n".join(lines))
 
+# Add at top of run()
+import msvcrt  # Linux only — on Windows use msvcrt or a lock file
+LOCK_PATH = Path(__file__).parent.parent.parent / "data" / "bot.lock"
 
+def run():
+    try:
+        lock = open(LOCK_PATH, "w")
+        # Windows lock file approach
+        lock.write(str(os.getpid()))
+        lock.flush()
+    except:
+        print("[LOG] Another instance running, exiting.")
+        return
+        
 # ── Main loop ───────────────────────────────────────────────────────────────────
 
 def run() -> None:
@@ -455,7 +509,12 @@ def run() -> None:
         if not text:
             continue
 
-        print(f"[LOG] Received: {text!r}")
+        # Get reply context — which bot message did the user reply to?
+        reply_to = msg.get("reply_to_message") or {}
+        reply_msg_id = str(reply_to.get("message_id", "")) if reply_to else ""
+
+        print(f"[LOG] Received: {text!r} (reply_to={reply_msg_id or 'none'})")
+
         lower = text.lower()
         parts = lower.split()
 
@@ -473,10 +532,9 @@ def run() -> None:
         elif lower.startswith("skipsupplier "):
             _handle_skipsupplier(parts)
         elif lower in ("/yes", "yes"):
-            _handle_yes(state)
+            _handle_yes(state, reply_msg_id)
         elif lower in ("/no", "/cancel", "no", "cancel"):
-            state["pending_confirmation"] = None
-            _send("Cancelled.")
+            _handle_no(state, reply_msg_id)
         elif lower.startswith("/addproduct"):
             _handle_addproduct(text, state)
         elif lower == "/pending":
@@ -492,7 +550,7 @@ def run() -> None:
                 "`skipsupplier <id>` — skip supplier\n"
                 "`/pending` — list all unresolved\n"
                 "`/addproduct <name> | <ingredient>` — manual product entry\n"
-                "`/yes` / `/no` — confirm or cancel"
+                "`/yes` / `/no` — reply to a confirm message to act on it"
             )
 
     _save_state(state)

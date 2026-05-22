@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -7,6 +8,8 @@ from decimal import Decimal, InvalidOperation
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+
+_TICK_ONLY = re.compile(r'^[\s✓✔√,./]+$')
 
 load_dotenv()
 
@@ -28,14 +31,15 @@ SYSTEM_PROMPT = (
     '      "do_number": "string or null",\n'
     '      "invoice_date": "YYYY-MM-DD or null",\n'
     '      "has_handwriting": true or false,\n'
-    '      "handwriting_content": "verbatim transcription of all handwritten text, or null if none",\n'
+    '      "handwriting_content": "verbatim transcription of meaningful handwritten annotations, or null if none",\n'
     '      "line_items": [\n'
     '        {\n'
     '          "product_name": "string or null",\n'
     '          "quantity": number or null,\n'
     '          "unit": "kg/pcs/btl/ctn/etc or null",\n'
     '          "unit_price": number or null,\n'
-    '          "total_price": number or null\n'
+    '          "total_price": number or null,\n'
+    '          "crossed_out": true or false\n'
     '        }\n'
     '      ]\n'
     '    }\n'
@@ -46,8 +50,12 @@ SYSTEM_PROMPT = (
     "- For dates use YYYY-MM-DD.\n"
     "- For numbers use numeric values, not strings.\n"
     "- If a field is missing or unreadable use null.\n"
-    "- has_handwriting must be true if ANY handwritten text appears anywhere on the document.\n"
-    "- handwriting_content must transcribe handwritten notes and annotations only — exclude signatures, company names, company registration numbers, and rubber stamps.\n"
+    "- has_handwriting: set true ONLY for meaningful handwriting — words (English, Chinese, Malay), "
+    "X marks, cross-outs, or handwritten numbers. "
+    "Tick marks and checkmarks (✓ ✔) alone are NOT meaningful — set has_handwriting: false.\n"
+    "- handwriting_content: transcribe meaningful handwritten annotations verbatim. "
+    "Exclude signatures, company names, registration numbers, rubber stamps, and tick/checkmarks.\n"
+    "- crossed_out: set true on any line item that has been crossed out or marked with X by hand.\n"
     "- Return ONLY the JSON object."
 )
 
@@ -141,6 +149,11 @@ def _parse_invoices(raw_invoices: list) -> List[Dict[str, Any]]:
         has_handwriting = bool(inv.get("has_handwriting", False))
         handwriting_content = inv.get("handwriting_content") or None
 
+        # Ticks/checkmarks alone are not actionable — suppress
+        if has_handwriting and handwriting_content and _TICK_ONLY.match(handwriting_content):
+            has_handwriting = False
+            handwriting_content = None
+
         if not supplier_name:
             flags.append("missing_supplier_name")
         if not invoice_number:
@@ -181,6 +194,7 @@ def _parse_line_items(raw_items: list) -> List[Dict[str, Any]]:
         unit = item.get("unit") or None
         unit_price = _to_decimal(item.get("unit_price"))
         total_price = _to_decimal(item.get("total_price"))
+        crossed_out = bool(item.get("crossed_out", False))
 
         if not product_name:
             item_flags.append("missing_product_name")
@@ -190,6 +204,8 @@ def _parse_line_items(raw_items: list) -> List[Dict[str, Any]]:
             item_flags.append("missing_unit_price")
         if total_price is None:
             item_flags.append("missing_total_price")
+        if crossed_out:
+            item_flags.append("crossed_out")
 
         line_items.append(
             {
@@ -198,6 +214,7 @@ def _parse_line_items(raw_items: list) -> List[Dict[str, Any]]:
                 "unit": unit,
                 "unit_price": unit_price,
                 "total_price": total_price,
+                "crossed_out": crossed_out,
                 "confidence": None,
                 "flags": item_flags,
             }
