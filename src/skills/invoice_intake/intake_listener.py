@@ -34,6 +34,8 @@ _INBOX_DIR = _DATA_DIR / "invoices_inbox"
 _PARSED_DIR = _DATA_DIR / "parsed_results"
 _STATE_PATH = _DATA_DIR / "invoice_intake_state.json"
 
+_PENDING_TTL = 60  # seconds before /yes expires
+
 _TG_API = f"https://api.telegram.org/bot{_RECEIVER_TOKEN}"
 
 
@@ -42,14 +44,24 @@ _TG_API = f"https://api.telegram.org/bot{_RECEIVER_TOKEN}"
 def _load_state() -> dict:
     if _STATE_PATH.exists():
         with open(_STATE_PATH, encoding="utf-8") as f:
-            return json.load(f)
-    return {"last_update_id": 0}
+            state = json.load(f)
+        state.setdefault("pending_non_invoice", [])
+        return state
+    return {"last_update_id": 0, "pending_non_invoice": []}
 
 
 def _save_state(state: dict) -> None:
     _STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(_STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
+
+
+def _prune_pending(state: dict) -> None:
+    now = time.time()
+    state["pending_non_invoice"] = [
+        p for p in state.get("pending_non_invoice", [])
+        if now - p["timestamp"] < _PENDING_TTL
+    ]
 
 
 # ── Telegram helpers ───────────────────────────────────────────────────────────
@@ -79,11 +91,10 @@ def detect_page_number(raw_text: str) -> tuple[int | None, int | None]:
     """Returns (page_num, total_pages). Both None if not found."""
     if not raw_text:
         return None, None
-
     patterns = [
         r"page\s*(\d+)\s*(?:of|/)\s*(\d+)",
         r"pg\.?\s*(\d+)\s*(?:of|/)\s*(\d+)",
-        r"\b(\d+)\s*/\s*(\d+)\b",  # bare "1/2" — risky but common
+        r"\b(\d+)\s*/\s*(\d+)\b",
     ]
     for pat in patterns:
         m = re.search(pat, raw_text, re.IGNORECASE)
@@ -148,9 +159,26 @@ def _find_existing_result(invoice_number: str) -> dict | None:
     return None
 
 
+# ── Total status for notification ──────────────────────────────────────────────
+
+def _total_line(invoice: dict, warnings: list) -> str | None:
+    """Format a one-line total summary for the parse success notification."""
+    inv_total = invoice.get("invoice_total")
+    if inv_total is None:
+        return None
+    computed = "invoice_total_computed" in invoice.get("flags", [])
+    val = f"RM{float(inv_total):.2f}"
+    mismatch = any(w["type"] in ("invoice_total_mismatch", "line_total_mismatch") for w in warnings)
+    if mismatch:
+        return f"{val} ⚠️ mismatch"
+    if computed:
+        return f"{val} (calculated)"
+    return f"{val} ✅"
+
+
 # ── Core processing ────────────────────────────────────────────────────────────
 
-def _process_file(file_path: str, state: dict) -> None:
+def _process_file(file_path: str, state: dict, force: bool = False) -> None:
     step1 = extract_invoice(file_path)
 
     if step1.get("status") == "error":
@@ -167,10 +195,19 @@ def _process_file(file_path: str, state: dict) -> None:
     supplier = invoice.get("supplier_name") or ""
 
     if not invoice_number and not supplier:
-        print(f"[LOG] Filtered non-invoice: {file_path}")
-        _send_reply(_GROUP_CHAT_ID, "Doesn't look like an invoice — no invoice number or supplier detected. Ignored.")
-        Path(file_path).unlink(missing_ok=True)
-        return
+        if not force:
+            print(f"[LOG] Non-invoice detected, asking user: {file_path}")
+            _send_reply(
+                _GROUP_CHAT_ID,
+                "Doesn't look like an invoice — no invoice number or supplier detected.\n"
+                "Reply /yes within 60s to parse anyway, or ignore to skip."
+            )
+            state.setdefault("pending_non_invoice", []).append({
+                "file_path": file_path,
+                "timestamp": time.time(),
+            })
+            return
+        print(f"[LOG] Force-processing non-invoice: {file_path}")
 
     page_num, total_pages = detect_page_number(invoice.get("raw_text", ""))
     source_files: list[dict] = [{"path": file_path, "page_num": page_num, "total_pages": total_pages}]
@@ -214,8 +251,11 @@ def _process_file(file_path: str, state: dict) -> None:
     else:
         print(f"[LOG] No invoice number — cannot dedupe: {file_path}")
 
+    # Fill missing totals then verify; collect warnings per invoice
+    all_warnings = []
     for inv in step1.get("invoices", []):
-        warnings = _cross_check(inv)
+        warnings = _cross_check(inv)  # fills missing totals + returns mismatches
+        all_warnings.extend(warnings)
         if warnings:
             inv["cross_check_warnings"] = warnings
             notify_cross_check_warnings(inv, warnings, file_path)
@@ -225,7 +265,8 @@ def _process_file(file_path: str, state: dict) -> None:
     except Exception as e:
         print(f"[LOG] ERROR saving parsed result: {e}", flush=True)
 
-    notify_parse_success(invoice_number or "Unknown", supplier, file_path)
+    tl = _total_line(step1.get("invoices", [{}])[0], all_warnings)
+    notify_parse_success(invoice_number or "Unknown", supplier, file_path, total_line=tl)
 
     payloads = build_comparison(step1)
     for payload in payloads:
@@ -243,6 +284,25 @@ def _handle_update(update: dict, state: dict) -> None:
     print(f"[LOG] Message from chat_id={chat_id} (whitelist={_GROUP_CHAT_ID})")
 
     if chat_id != _GROUP_CHAT_ID:
+        return
+
+    text = (message.get("text") or "").strip()
+
+    if text == "/yes":
+        pending = state.get("pending_non_invoice", [])
+        now = time.time()
+        valid = [p for p in pending if now - p["timestamp"] < _PENDING_TTL]
+        if valid:
+            p = valid[-1]
+            state["pending_non_invoice"] = [x for x in pending if x is not p]
+            print(f"[LOG] /yes — force processing {p['file_path']}")
+            try:
+                _process_file(p["file_path"], state, force=True)
+            except Exception as e:
+                print(f"[LOG] Error force processing: {e}")
+                notify_parse_failure(p["file_path"], str(e))
+        else:
+            print(f"[LOG] /yes received but no pending files within {_PENDING_TTL}s")
         return
 
     photo = message.get("photo")
@@ -286,6 +346,8 @@ def main():
 
     while True:
         try:
+            _prune_pending(state)
+
             params = {
                 "offset": state["last_update_id"] + 1,
                 "timeout": 30,

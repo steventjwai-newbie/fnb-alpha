@@ -56,13 +56,16 @@ def notify_handwriting_detected(invoice: dict, file_path: str) -> bool:
     return _send_parse("\n".join(lines))
 
 
-def notify_parse_success(invoice_number: str, supplier: str, file_path: str) -> bool:
+def notify_parse_success(invoice_number: str, supplier: str, file_path: str,
+                          total_line: str | None = None) -> bool:
     lines = [
         "✅ *Invoice parsed*",
         f"Invoice: `{invoice_number or 'Unknown'}`",
         f"Supplier: {supplier or 'Unknown'}",
-        f"File: `{file_path}`",
     ]
+    if total_line:
+        lines.append(f"Total: {total_line}")
+    lines.append(f"File: `{file_path}`")
     print(f"[LOG] Sending parse success for invoice {invoice_number}")
     return _send_parse("\n".join(lines))
 
