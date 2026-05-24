@@ -4,18 +4,25 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "-5257569290")
-
-_SEATABLE_BOT_TOKEN = os.getenv("SEATABLE_BOT_TOKEN")
+_PARSE_TOKEN = os.getenv("INVOICE_PARSE_NOTIFICATION_TOKEN")
+_SEATABLE_TOKEN = os.getenv("SEATABLE_BOT_TOKEN")
+_PARSE_CHAT_ID = os.getenv("INVOICE_GROUP_CHAT_ID", "-5257569290")
 _SEATABLE_CHAT_ID = os.getenv("SEATABLE_BOT_CHAT_ID", "-5150446443")
 
 
-def _send(text: str) -> bool:
-    url = f"https://api.telegram.org/bot{_BOT_TOKEN}/sendMessage"
-    resp = requests.post(url, json={"chat_id": _CHAT_ID, "text": text, "parse_mode": "Markdown"})
+def _send_parse(text: str) -> bool:
+    url = f"https://api.telegram.org/bot{_PARSE_TOKEN}/sendMessage"
+    resp = requests.post(url, json={"chat_id": _PARSE_CHAT_ID, "text": text, "parse_mode": "Markdown"})
     if not resp.ok:
-        print(f"[LOG] Telegram error: {resp.status_code} {resp.text}")
+        print(f"[LOG] Parse bot error: {resp.status_code} {resp.text}")
+    return resp.ok
+
+
+def _send_seatable(text: str) -> bool:
+    url = f"https://api.telegram.org/bot{_SEATABLE_TOKEN}/sendMessage"
+    resp = requests.post(url, json={"chat_id": _SEATABLE_CHAT_ID, "text": text, "parse_mode": "Markdown"})
+    if not resp.ok:
+        print(f"[LOG] Seatable bot error: {resp.status_code} {resp.text}")
     return resp.ok
 
 
@@ -46,19 +53,52 @@ def notify_handwriting_detected(invoice: dict, file_path: str) -> bool:
 
     lines.append("Please review and resolve.")
     print(f"[LOG] Sending handwriting alert for invoice {invoice_num}")
-    return _send("\n".join(lines))
+    return _send_parse("\n".join(lines))
 
 
-def _send_seatable(text: str) -> bool:
-    url = f"https://api.telegram.org/bot{_SEATABLE_BOT_TOKEN}/sendMessage"
-    resp = requests.post(url, json={"chat_id": _SEATABLE_CHAT_ID, "text": text, "parse_mode": "Markdown"})
-    if not resp.ok:
-        print(f"[LOG] Seatable bot error: {resp.status_code} {resp.text}")
-    return resp.ok
+def notify_parse_success(invoice_number: str, supplier: str, file_path: str) -> bool:
+    lines = [
+        "✅ *Invoice parsed*",
+        f"Invoice: `{invoice_number or 'Unknown'}`",
+        f"Supplier: {supplier or 'Unknown'}",
+        f"File: `{file_path}`",
+    ]
+    print(f"[LOG] Sending parse success for invoice {invoice_number}")
+    return _send_parse("\n".join(lines))
+
+
+def notify_parse_failure(file_path: str, error_msg: str) -> bool:
+    lines = [
+        "❌ *Invoice parse failed*",
+        f"File: `{file_path}`",
+        f"Error: _{error_msg}_",
+    ]
+    print(f"[LOG] Sending parse failure for {file_path}")
+    return _send_parse("\n".join(lines))
+
+
+def notify_cross_check_warnings(invoice: dict, warnings: list, file_path: str) -> bool:
+    invoice_num = invoice.get("invoice_number") or "Unknown"
+    supplier = invoice.get("supplier_name") or "Unknown supplier"
+    lines = [
+        f"🔢 *Cross-check failed* — {len(warnings)} mismatch(es)",
+        f"Invoice: `{invoice_num}` ({supplier})",
+    ]
+    for w in warnings:
+        if w["type"] == "line_total_mismatch":
+            lines.append(
+                f"  • {w['product']}: {w['qty']} × RM{w['unit_price']} = RM{w['expected']} ≠ RM{w['actual']}"
+            )
+        elif w["type"] == "invoice_total_mismatch":
+            lines.append(
+                f"  • Lines sum RM{w['computed']} ≠ Invoice total RM{w['invoice_total']}"
+            )
+    lines.append(f"_File: {file_path}_")
+    print(f"[LOG] Sending cross-check warning for invoice {invoice_num} ({len(warnings)} mismatch(es))")
+    return _send_parse("\n".join(lines))
 
 
 def notify_tier4_items(invoice: dict, tier4_records: list, file_path: str) -> None:
-    """Send one Telegram message per unmatched item to seatable_update_bot."""
     invoice_num = invoice.get("invoice_number") or "Unknown"
     supplier = invoice.get("supplier_name") or "Unknown supplier"
 
@@ -97,7 +137,6 @@ def notify_invoice_comparison(payload: dict) -> bool:
 
 
 def notify_missing_supplier(invoice_number: str, supplier_name: str, record_id: str, candidates: list, file_path: str) -> bool:
-    """Alert seatable_update_bot when invoice supplier isn't in Seatable."""
     lines = [f"🏭 *Unknown supplier — {invoice_number}*\n"]
     safe_name = supplier_name or "(no name)"
     lines.append(f"Invoice says: `{safe_name}`")
@@ -116,3 +155,8 @@ def notify_missing_supplier(invoice_number: str, supplier_name: str, record_id: 
 
     print(f"[LOG] Sending missing supplier alert for invoice {invoice_number}")
     return _send_seatable("\n".join(lines))
+
+
+def notify_cost_alert(text: str) -> bool:
+    print(f"[LOG] Sending cost alert ({len(text)} chars)")
+    return _send_seatable(text)

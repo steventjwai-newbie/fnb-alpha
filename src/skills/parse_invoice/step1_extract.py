@@ -218,22 +218,22 @@ def _process_invoices(result) -> List[Dict[str, Any]]:
 
         invoice_groups[key].append(doc)
 
+    raw_text = result.content if hasattr(result, "content") else None
+
     for key, documents in invoice_groups.items():
-        # Merge all documents with same invoice number into one object
-        merged_invoice = _merge_invoice_documents(documents)
+        merged_invoice = _merge_invoice_documents(documents, raw_text=raw_text)
         invoices.append(merged_invoice)
 
     return invoices
 
 
-def _merge_invoice_documents(documents: List) -> Dict[str, Any]:
+def _merge_invoice_documents(documents: List, raw_text=None) -> Dict[str, Any]:
     """Merge multiple documents with same invoice number into one invoice object."""
     if not documents:
         return {}
 
-    # Build from first document, then merge line items from all documents
     first_doc = documents[0]
-    invoice_obj = _build_invoice_object(first_doc, skip_confidence=True)
+    invoice_obj = _build_invoice_object(first_doc, skip_confidence=True, raw_text=raw_text)
 
     # Merge line items from remaining documents
     for doc in documents[1:]:
@@ -249,7 +249,7 @@ def _merge_invoice_documents(documents: List) -> Dict[str, Any]:
     return invoice_obj
 
 
-def _build_invoice_object(document, skip_confidence: bool = False) -> Dict[str, Any]:
+def _build_invoice_object(document, skip_confidence: bool = False, raw_text=None) -> Dict[str, Any]:
     """Build a single invoice object from Azure DI document."""
     flags: List[str] = []
 
@@ -278,10 +278,12 @@ def _build_invoice_object(document, skip_confidence: bool = False) -> Dict[str, 
         "invoice_date": invoice_date,
         "confidence": confidence,
         "extraction_method": "azure_di",
+        "raw_text": raw_text,
         "flags": flags,
         "line_items": line_items,
     }
 
+    result["flags"].extend(_verify_totals(result))
     return result
 
 
@@ -436,6 +438,49 @@ def _parse_number(value: Optional[str]) -> Optional[Decimal]:
         return Decimal(value)
     except (InvalidOperation, ValueError, TypeError):
         return None
+
+
+def _verify_totals(invoice: Dict[str, Any]) -> list:
+    flags = []
+    for i, item in enumerate(invoice.get("line_items", []), 1):
+        q = item.get("quantity")
+        up = item.get("unit_price")
+        tp = item.get("total_price")
+        if q is not None and up is not None and tp is not None:
+            try:
+                expected = Decimal(str(q)) * Decimal(str(up))
+                actual = Decimal(str(tp))
+                if expected > 0:
+                    diff_pct = abs((actual - expected) / expected) * 100
+                    if diff_pct > 1:
+                        flags.append(
+                            f"line_{i}_total_mismatch: {q}x{up}={expected} vs invoice={actual}"
+                        )
+            except Exception:
+                pass
+
+    line_sum = Decimal("0")
+    for item in invoice.get("line_items", []):
+        tp = item.get("total_price")
+        if tp is not None:
+            try:
+                line_sum += Decimal(str(tp))
+            except Exception:
+                pass
+
+    invoice_total = invoice.get("invoice_total") or invoice.get("total") or invoice.get("subtotal")
+    if invoice_total and line_sum > 0:
+        try:
+            inv_total_dec = Decimal(str(invoice_total))
+            diff_pct = abs((line_sum - inv_total_dec) / inv_total_dec) * 100
+            if diff_pct > 1:
+                flags.append(
+                    f"invoice_total_mismatch: lines_sum={line_sum} vs invoice_total={inv_total_dec}"
+                )
+        except Exception:
+            pass
+
+    return flags
 
 
 def _needs_gemini_fallback(invoice: Dict[str, Any]) -> bool:

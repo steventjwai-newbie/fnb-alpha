@@ -30,6 +30,7 @@ SYSTEM_PROMPT = (
     '      "invoice_number": "string or null",\n'
     '      "do_number": "string or null",\n'
     '      "invoice_date": "YYYY-MM-DD or null",\n'
+    '      "invoice_total": number or null,\n'
     '      "has_handwriting": true or false,\n'
     '      "handwriting_content": "verbatim transcription of meaningful handwritten annotations, or null if none",\n'
     '      "line_items": [\n'
@@ -110,7 +111,7 @@ def extract_invoice_gemini(file_path: str) -> Dict[str, Any]:
 
         raw = response.text.strip()
         gemini_data = json.loads(raw)
-        invoices = _parse_invoices(gemini_data.get("invoices", []))
+        invoices = _parse_invoices(gemini_data.get("invoices", []), raw_text=raw)
 
         print(
             f"[LOG] Gemini extraction successful. Duration: {duration_ms}ms, "
@@ -137,7 +138,7 @@ def extract_invoice_gemini(file_path: str) -> Dict[str, Any]:
         return _error_response(file_path, error_msg, duration_ms)
 
 
-def _parse_invoices(raw_invoices: list) -> List[Dict[str, Any]]:
+def _parse_invoices(raw_invoices: list, raw_text: str = None) -> List[Dict[str, Any]]:
     invoices = []
     for inv in raw_invoices:
         flags: List[str] = []
@@ -146,6 +147,7 @@ def _parse_invoices(raw_invoices: list) -> List[Dict[str, Any]]:
         invoice_number = inv.get("invoice_number") or None
         do_number = inv.get("do_number") or None
         invoice_date = inv.get("invoice_date") or None
+        invoice_total = _to_decimal(inv.get("invoice_total"))
         has_handwriting = bool(inv.get("has_handwriting", False))
         handwriting_content = inv.get("handwriting_content") or None
 
@@ -167,20 +169,22 @@ def _parse_invoices(raw_invoices: list) -> List[Dict[str, Any]]:
         if not line_items:
             flags.append("no_line_items_found")
 
-        invoices.append(
-            {
-                "supplier_name": supplier_name,
-                "invoice_number": invoice_number,
-                "do_number": do_number,
-                "invoice_date": invoice_date,
-                "has_handwriting": has_handwriting,
-                "handwriting_content": handwriting_content,
-                "confidence": None,
-                "extraction_method": "gemini_fallback",
-                "flags": flags,
-                "line_items": line_items,
-            }
-        )
+        invoice_obj = {
+            "supplier_name": supplier_name,
+            "invoice_number": invoice_number,
+            "do_number": do_number,
+            "invoice_date": invoice_date,
+            "invoice_total": invoice_total,
+            "has_handwriting": has_handwriting,
+            "handwriting_content": handwriting_content,
+            "confidence": None,
+            "extraction_method": "gemini_fallback",
+            "raw_text": raw_text,
+            "flags": flags,
+            "line_items": line_items,
+        }
+        invoice_obj["flags"].extend(_verify_totals(invoice_obj))
+        invoices.append(invoice_obj)
     return invoices
 
 
@@ -220,6 +224,49 @@ def _parse_line_items(raw_items: list) -> List[Dict[str, Any]]:
             }
         )
     return line_items
+
+
+def _verify_totals(invoice: Dict[str, Any]) -> List[str]:
+    flags = []
+    for i, item in enumerate(invoice.get("line_items", []), 1):
+        q = item.get("quantity")
+        up = item.get("unit_price")
+        tp = item.get("total_price")
+        if q is not None and up is not None and tp is not None:
+            try:
+                expected = Decimal(str(q)) * Decimal(str(up))
+                actual = Decimal(str(tp))
+                if expected > 0:
+                    diff_pct = abs((actual - expected) / expected) * 100
+                    if diff_pct > 1:
+                        flags.append(
+                            f"line_{i}_total_mismatch: {q}x{up}={expected} vs invoice={actual}"
+                        )
+            except Exception:
+                pass
+
+    line_sum = Decimal("0")
+    for item in invoice.get("line_items", []):
+        tp = item.get("total_price")
+        if tp is not None:
+            try:
+                line_sum += Decimal(str(tp))
+            except Exception:
+                pass
+
+    invoice_total = invoice.get("invoice_total") or invoice.get("total") or invoice.get("subtotal")
+    if invoice_total and line_sum > 0:
+        try:
+            inv_total_dec = Decimal(str(invoice_total))
+            diff_pct = abs((line_sum - inv_total_dec) / inv_total_dec) * 100
+            if diff_pct > 1:
+                flags.append(
+                    f"invoice_total_mismatch: lines_sum={line_sum} vs invoice_total={inv_total_dec}"
+                )
+        except Exception:
+            pass
+
+    return flags
 
 
 def _to_decimal(value) -> Optional[Decimal]:
