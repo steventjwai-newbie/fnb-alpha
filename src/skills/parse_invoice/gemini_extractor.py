@@ -2,6 +2,7 @@ import json
 import os
 import re
 import time
+from datetime import date
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from decimal import Decimal, InvalidOperation
@@ -14,7 +15,42 @@ _TICK_ONLY = re.compile(r'^[\s✓✔√,./]+$')
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+_GEMINI_RPD = int(os.getenv("GEMINI_RPD", "20"))
+_USAGE_PATH = Path(__file__).parent.parent.parent.parent / "data" / "gemini_daily_usage.json"
+
+
+def _read_usage() -> dict:
+    if _USAGE_PATH.exists():
+        try:
+            with open(_USAGE_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("date") == str(date.today()):
+                return data
+        except Exception:
+            pass
+    return {"date": str(date.today()), "count": 0}
+
+
+def _increment_usage() -> int:
+    usage = _read_usage()
+    usage["count"] += 1
+    _USAGE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(_USAGE_PATH, "w", encoding="utf-8") as f:
+        json.dump(usage, f)
+    return usage["count"]
+
+
+def _check_daily_limit() -> tuple[bool, int]:
+    """Returns (allowed, current_count)."""
+    usage = _read_usage()
+    count = usage["count"]
+    if count >= _GEMINI_RPD:
+        print(f"[LOG] Gemini daily limit reached: {count}/{_GEMINI_RPD} calls used today")
+        return False, count
+    if count >= _GEMINI_RPD * 0.8:
+        print(f"[LOG] Gemini daily usage warning: {count}/{_GEMINI_RPD} calls used today")
+    return True, count
 
 SYSTEM_PROMPT = (
     "You are an invoice data extraction assistant. "
@@ -88,54 +124,68 @@ def extract_invoice_gemini(file_path: str) -> Dict[str, Any]:
         print(f"[LOG] Error: {error_msg}")
         return _error_response(file_path, error_msg, 0)
 
-    try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
+    allowed, used = _check_daily_limit()
+    if not allowed:
+        error_msg = f"Gemini daily limit reached ({used}/{_GEMINI_RPD}). Try again tomorrow."
+        return _error_response(file_path, error_msg, 0)
 
-        with open(file_path, "rb") as f:
-            file_bytes = f.read()
+    client = genai.Client(api_key=GEMINI_API_KEY)
 
-        print(f"[LOG] Calling Gemini fallback for: {file_path}")
+    with open(file_path, "rb") as f:
+        file_bytes = f.read()
 
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=[
-                types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
-                SYSTEM_PROMPT,
-            ],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-            ),
-        )
+    _RETRY_DELAYS = [15, 30, 60]  # seconds; covers 5 RPM window
 
-        duration_ms = int((time.time() - start_time) * 1000)
+    for attempt, delay in enumerate([0] + _RETRY_DELAYS):
+        if delay:
+            print(f"[LOG] Gemini rate-limited, retrying in {delay}s (attempt {attempt + 1}/4)...")
+            time.sleep(delay)
 
-        raw = response.text.strip()
-        gemini_data = json.loads(raw)
-        invoices = _parse_invoices(gemini_data.get("invoices", []), raw_text=raw)
+        try:
+            print(f"[LOG] Calling Gemini for: {file_path}")
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=[
+                    types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
+                    SYSTEM_PROMPT,
+                ],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                ),
+            )
 
-        print(
-            f"[LOG] Gemini extraction successful. Duration: {duration_ms}ms, "
-            f"Invoices: {len(invoices)}"
-        )
+            duration_ms = int((time.time() - start_time) * 1000)
+            raw = response.text.strip()
+            gemini_data = json.loads(raw)
+            invoices = _parse_invoices(gemini_data.get("invoices", []), raw_text=raw)
 
-        return {
-            "status": "success",
-            "file_path": str(file_path),
-            "error_message": None,
-            "invoices": invoices,
-            "api_call_summary": {
-                "success": True,
-                "pages_processed": 1,
-                "invoices_extracted": len(invoices),
-                "duration_ms": duration_ms,
-            },
-        }
+            daily_count = _increment_usage()
+            print(
+                f"[LOG] Gemini extraction successful. Duration: {duration_ms}ms, "
+                f"Invoices: {len(invoices)}, Daily usage: {daily_count}/{_GEMINI_RPD}"
+            )
 
-    except Exception as e:
-        duration_ms = int((time.time() - start_time) * 1000)
-        error_msg = str(e)
-        print(f"[LOG] Gemini fallback failed. Error: {error_msg}")
-        return _error_response(file_path, error_msg, duration_ms)
+            return {
+                "status": "success",
+                "file_path": str(file_path),
+                "error_message": None,
+                "invoices": invoices,
+                "api_call_summary": {
+                    "success": True,
+                    "pages_processed": 1,
+                    "invoices_extracted": len(invoices),
+                    "duration_ms": duration_ms,
+                },
+            }
+
+        except Exception as e:
+            err = str(e)
+            is_rate_limit = "429" in err or "quota" in err.lower() or "resource_exhausted" in err.lower()
+            if is_rate_limit and attempt < len(_RETRY_DELAYS):
+                continue
+            duration_ms = int((time.time() - start_time) * 1000)
+            print(f"[LOG] Gemini failed. Error: {err}")
+            return _error_response(file_path, err, duration_ms)
 
 
 def _parse_invoices(raw_invoices: list, raw_text: str = None) -> List[Dict[str, Any]]:
