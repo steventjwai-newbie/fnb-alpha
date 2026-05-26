@@ -5,7 +5,12 @@
       "PowerShell(cd \"C:\\\\Users\\\\Admin\\\\projects\\\\fnb-alpha\" ; Get-ChildItem \"tests/sample_invoices\" -File | ForEach-Object { $_.Name })",
       "PowerShell(Start-ScheduledTask *)",
       "PowerShell(Get-ScheduledTaskInfo *)",
-      "Bash(pip install *)"
+      "Bash(pip install *)",
+      "Skill(update-config)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "PowerShell(Test-Path *)",
+      "Bash(pip show *)"
     ]
   }
 }

@@ -18,9 +18,12 @@ def _send_parse(text: str) -> bool:
     return resp.ok
 
 
-def _send_seatable(text: str) -> bool:
+def _send_seatable(text: str, reply_markup: dict = None) -> bool:
     url = f"https://api.telegram.org/bot{_SEATABLE_TOKEN}/sendMessage"
-    resp = requests.post(url, json={"chat_id": _SEATABLE_CHAT_ID, "text": text, "parse_mode": "Markdown"})
+    payload = {"chat_id": _SEATABLE_CHAT_ID, "text": text, "parse_mode": "Markdown"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    resp = requests.post(url, json=payload)
     if not resp.ok:
         print(f"[LOG] Seatable bot error: {resp.status_code} {resp.text}")
     return resp.ok
@@ -135,8 +138,12 @@ def notify_tier4_items(invoice: dict, tier4_records: list, file_path: str) -> No
 
 def notify_invoice_comparison(payload: dict) -> bool:
     from step2_compare import format_telegram_message
+    from approval_handler import save_pending, build_inline_keyboard
     msg = format_telegram_message(payload)
-    return _send_seatable(msg)
+    save_pending(payload["invoice_number"], payload)
+    keyboard = build_inline_keyboard(payload)
+    markup = keyboard.to_dict() if keyboard else None
+    return _send_seatable(msg, reply_markup=markup)
 
 
 def notify_missing_supplier(invoice_number: str, supplier_name: str, record_id: str, candidates: list, file_path: str) -> bool:

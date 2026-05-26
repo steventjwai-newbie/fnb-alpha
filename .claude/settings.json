@@ -15,5 +15,58 @@
       "Bash:sudo:*",
       "Bash:rm -rf:*"
     ]
+  },
+  "mcpServers": {
+    "obsidian": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["obsidian-mcp-server@latest"],
+      "env": {
+        "OBSIDIAN_API_KEY": "Bearer 9f67c27f7d28f310351eb8f3e260310b823cc8abb81b8ab0c5db25ae0cc0a7f2",
+        "OBSIDIAN_BASE_URL": "https://127.0.0.1:27124",
+        "OBSIDIAN_VERIFY_SSL": "false"
+      }
+    },
+    "openbb": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["--from", "openbb-mcp-server", "--with", "openbb", "openbb-mcp", "--transport", "stdio"]
+    },
+    "alphavantage": {
+      "type": "http",
+      "url": "https://mcp.alphavantage.co/mcp?apikey=0UNF6B9N4SOSDV3Q"
+    },
+    "telegram-chaindead": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@chaindead/telegram-mcp"],
+      "env": {
+        "TELEGRAM_API_ID": "35794478",
+        "TELEGRAM_API_HASH": "55e51d51342832dfd24826b811e43171"
+      }
+    },
+    "telegram-antongsm": {
+      "type": "stdio",
+      "command": "mcp-telegram"
+    },
+    "seatable": {
+      "type": "http",
+      "url": "https://mcp.seatable.com",
+      "headers": {
+        "Authorization": "Bearer faad97d9fb73d2769c7944b66b39326ca3c9330f"
+      }
+    },
+    "filesystem": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "src/skills/parse_invoice"]
+    },
+    "pletor": {
+      "type": "http",
+      "url": "https://api.pletor.ai/mcp"
+    }
+  },
+  "enabledPlugins": {
+    "telegram@claude-plugins-official": true
   }
 }
