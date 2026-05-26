@@ -78,20 +78,36 @@ def write_price_history(
 ) -> bool:
     """
     Append a row to Price History. Returns True on success.
+    Link columns (Supplier product, Invoice Reference) are optional.
     """
     change_pct = ((new_price - old_price) / old_price * 100) if old_price else 0
     row_payload = {
-        "Supplier product (link)": [sp_row_id] if sp_row_id else [],
         "Old Price": old_price,
         "New Price": new_price,
         "Change %": round(change_pct, 2),
-        "Invoice Reference": [invoice_row_id] if invoice_row_id else [],
         "Flagged By": flagged_by,
     }
+    # Add optional link columns if they exist
+    if sp_row_id:
+        row_payload["Supplier product (link)"] = [sp_row_id]
+    if invoice_row_id:
+        row_payload["Invoice Reference"] = [invoice_row_id]
+
     try:
         base.append_row(PRICE_HISTORY_TABLE, row_payload)
         return True
     except Exception as e:
+        # If link columns don't exist, try again without them
+        if "link" in str(e).lower() or "not found" in str(e).lower():
+            print(f"[WARNING] Price History link columns unavailable, writing without links")
+            row_payload.pop("Supplier product (link)", None)
+            row_payload.pop("Invoice Reference", None)
+            try:
+                base.append_row(PRICE_HISTORY_TABLE, row_payload)
+                return True
+            except Exception as e2:
+                print(f"[ERROR] Failed to write Price History row (retry): {e2}")
+                return False
         print(f"[ERROR] Failed to write Price History row: {e}")
         return False
 
