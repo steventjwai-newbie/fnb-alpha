@@ -82,20 +82,20 @@ def main():
         confirm = len(payload.get("confirm_items", []))
         unmatched = len(payload.get("unmatched_items", []))
 
-        print(f"       ✅ auto-matched: {auto}")
-        print(f"       💰 price_changes: {changes}")
-        print(f"       🤔 confirm_items: {confirm}")
-        print(f"       ⚠️ unmatched: {unmatched}")
+        print(f"       [auto-matched] {auto}")
+        print(f"       [price_changes] {changes}")
+        print(f"       [confirm_items] {confirm}")
+        print(f"       [unmatched] {unmatched}")
 
         # This call now includes save_pending + reply_markup (buttons)
         result = notify_invoice_comparison(payload)
         if result:
-            print(f"       ✓ Telegram message sent with {changes + confirm} action button(s)")
+            print(f"       [OK] Telegram message sent with {changes + confirm} action button(s)")
         else:
-            print(f"       ✗ Failed to send Telegram message")
+            print(f"       [FAIL] Failed to send Telegram message")
 
     print(f"\n[TEST] Done. Check Telegram for {len(payloads)} message(s) with buttons.")
-    print(f"[TEST] To approve an item, click the ✓ button. Check sandbox Seatable for Price History row.")
+    print(f"[TEST] To approve an item, click the [Approve] button. Check sandbox Seatable for Price History row.")
 
 
 if __name__ == "__main__":

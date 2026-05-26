@@ -100,6 +100,7 @@ def update_sp_price(base: Base, sp_row_id: str, new_price: float) -> bool:
     """
     Update Supplier Product's Price per Pack and Date Updated.
     Returns True on success.
+    Note: If big data API fails, logs warning but returns True (Price History already written).
     """
     try:
         base.update_row(SUPPLIER_PRODUCTS_TABLE, sp_row_id, {
@@ -108,6 +109,10 @@ def update_sp_price(base: Base, sp_row_id: str, new_price: float) -> bool:
         })
         return True
     except Exception as e:
+        if "big data storage" in str(e).lower():
+            print(f"[WARNING] SP price update skipped (big data API unavailable): {e}")
+            print(f"[WARNING] Price History was written; manual SP price update may be needed")
+            return True  # Price History written, so don't fail the whole workflow
         print(f"[ERROR] Failed to update SP row {sp_row_id}: {e}")
         return False
 

@@ -187,7 +187,7 @@ def build_comparison(step1_result: Dict[str, Any]) -> List[Dict[str, Any]]:
             product_names = [p.get("Supplier Product Name", "") for p in supplier_products]
             norm_product_names = [_norm(n) for n in product_names]
             supplier_candidates = []
-            print(f"[LOG] Supplier '{supplier_name}' → matched. {len(supplier_products)} products in scope.")
+            print(f"[LOG] Supplier '{supplier_name}' -> matched. {len(supplier_products)} products in scope.")
         else:
             supplier_products = []
             product_names = []
