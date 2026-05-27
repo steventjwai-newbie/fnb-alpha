@@ -159,7 +159,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else f"Manual:{user_ref}"
             )
 
-            result = commit_price_change(item, payload, flagged_by=flagged_by)
+            result = commit_price_change(
+                item,
+                payload,
+                flagged_by=flagged_by,
+                invoice_file_path=payload.get("invoice_file_path"),
+            )
             if result["status"] == "ok":
                 statuses[idx_str] = "approved"
                 results.append(f"{idx_str}: ✓ {item['sp_code']} → RM{item['new_price']:.2f}")

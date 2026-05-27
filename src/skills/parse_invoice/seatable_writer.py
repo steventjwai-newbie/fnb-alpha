@@ -11,6 +11,7 @@ All writes are logged with audit metadata (Flagged By, timestamp).
 
 import os
 from datetime import datetime
+from pathlib import Path
 from typing import Optional, Dict, Any
 
 from dotenv import load_dotenv
@@ -66,6 +67,37 @@ def upsert_invoice_row(
     except Exception as e:
         print(f"[ERROR] Failed to create Invoices row: {e}")
         return None
+
+
+def attach_invoice_file(
+    base: Base,
+    invoice_row_id: str,
+    file_path: str,
+) -> bool:
+    """
+    Upload invoice PDF/image and attach to Invoices row.
+    Returns True on success. Failures are logged but non-fatal.
+    """
+    try:
+        file_obj = Path(file_path)
+        if not file_obj.exists():
+            print(f"[WARNING] Invoice file not found: {file_path}")
+            return False
+
+        # Upload via SDK
+        print(f"[LOG] Uploading invoice file: {file_path}")
+        uploaded = base.upload_local_file(str(file_obj.absolute()))
+
+        # Attach to invoice row
+        base.update_row(INVOICES_TABLE, invoice_row_id, {
+            "PDF/Image Attachment": [uploaded]
+        })
+        print(f"[LOG] Attached file to invoice {invoice_row_id}")
+        return True
+
+    except Exception as e:
+        print(f"[WARNING] Failed to attach invoice file: {e}")
+        return False  # Non-fatal
 
 
 def write_price_history(
@@ -147,10 +179,11 @@ def commit_price_change(
     item: Dict[str, Any],
     invoice_payload: Dict[str, Any],
     flagged_by: str,
+    invoice_file_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Atomic-ish write: ensures Invoices row exists, then writes Price History,
-    then updates Supplier Product. Returns dict with status + details.
+    Atomic-ish write: ensures Invoices row exists, optionally attaches file,
+    writes Price History, then updates Supplier Product. Returns dict with status + details.
 
     Note: not transactional. If SP update fails after Price History write,
     you'll have an orphan history row. Acceptable for v1.
@@ -166,6 +199,10 @@ def commit_price_change(
     )
     if not invoice_row_id:
         return {"status": "error", "step": "invoices", "message": "Could not upsert invoice row"}
+
+    # Optionally attach invoice file
+    if invoice_file_path:
+        attach_invoice_file(base, invoice_row_id, invoice_file_path)
 
     ok_history = write_price_history(
         base=base,

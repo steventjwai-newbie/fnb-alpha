@@ -270,6 +270,8 @@ def _process_file(file_path: str, state: dict, force: bool = False) -> None:
 
     payloads = build_comparison(step1)
     for payload in payloads:
+        # Add file path for optional file attachment to Invoices
+        payload["invoice_file_path"] = str(file_path)
         notify_invoice_comparison(payload)
 
 
