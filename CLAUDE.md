@@ -246,6 +246,19 @@ Sandbox testing protocol:
 Never write to production Seatable from a test session. If you're 
 not sure which base you're hitting, print SEATABLE_BASE_URL at 
 startup and verify.
+
+Investigate the dtable-db big data routing issue in seatable_writer.py.
+Steps:
+1. Run update_sp_price() against production base on a known-safe SP 
+   (pick an Active=False or unused product). Report whether it errors.
+2. If production works but sandbox fails → sandbox config issue, 
+   document the difference.
+3. If production also fails → try the direct-HTTP workaround in 
+   seatable_writer.py. Inspect base object attributes to find the 
+   right URL and token. Iterate.
+4. Do NOT redesign the schema (Workaround B) without Steven's /yes.
+   It's a big change requiring his judgment.
+   
 ---
 
 ## Testing protocol

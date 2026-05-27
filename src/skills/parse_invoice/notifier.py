@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 _PARSE_TOKEN = os.getenv("INVOICE_PARSE_NOTIFICATION_TOKEN")
-_SEATABLE_TOKEN = os.getenv("SEATABLE_BOT_TOKEN")
+_SEATABLE_TOKEN = os.getenv("SEATABLE_UPDATE_BOT_TOKEN")
 _PARSE_CHAT_ID = os.getenv("INVOICE_GROUP_CHAT_ID", "-5257569290")
 _SEATABLE_CHAT_ID = os.getenv("SEATABLE_BOT_CHAT_ID", "-5150446443")
 

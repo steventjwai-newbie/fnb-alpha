@@ -28,7 +28,7 @@ load_dotenv()
 # Use the same bot that sends notifications so it can edit its own messages
 SEATABLE_UPDATE_BOT_TOKEN = os.getenv("SEATABLE_UPDATE_BOT_TOKEN")
 
-PENDING_DIR = Path(__file__).parent / "data" / "pending_approvals"
+PENDING_DIR = Path(__file__).parent.parent.parent.parent / "data" / "pending_approvals"
 PENDING_DIR.mkdir(parents=True, exist_ok=True)
 
 

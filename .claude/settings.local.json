@@ -10,7 +10,11 @@
       "Bash(git add *)",
       "Bash(git commit -m ' *)",
       "PowerShell(Test-Path *)",
-      "Bash(pip show *)"
+      "Bash(pip show *)",
+      "Bash(git commit -m 'Handle big data API failures gracefully, fix Unicode encoding in test output *)",
+      "Bash(git commit -m 'Make Price History link columns optional for sandbox testing *)",
+      "Bash(cat)",
+      "Read(//tmp/**)"
     ]
   }
 }
