@@ -58,15 +58,72 @@ def upsert_invoice_row(
         "Invoice Date": invoice_date,
         "Processed": False,
     }
-    if supplier_row_id:
-        row_payload["Supplier (Link)"] = [supplier_row_id]
 
     try:
         new_row = base.append_row(INVOICES_TABLE, row_payload)
-        return new_row.get("_id") if new_row else None
+        invoice_row_id = new_row.get("_id") if new_row else None
+
+        # Add supplier link if provided (use add_link API, not direct write)
+        if invoice_row_id and supplier_row_id:
+            try:
+                add_row_link(
+                    base=base,
+                    link_column_table=INVOICES_TABLE,
+                    link_column_name="Supplier (Link)",
+                    link_column_row_id=invoice_row_id,
+                    target_table="Suppliers",
+                    target_row_id=supplier_row_id,
+                )
+            except Exception as e:
+                print(f"[WARNING] Could not link supplier to invoice: {e}")
+
+        return invoice_row_id
     except Exception as e:
         print(f"[ERROR] Failed to create Invoices row: {e}")
         return None
+
+
+def add_row_link(
+    base: Base,
+    link_column_table: str,
+    link_column_name: str,
+    link_column_row_id: str,
+    target_table: str,
+    target_row_id: str,
+) -> bool:
+    """
+    Create a link between two rows using the link column API.
+
+    Args:
+        link_column_table: Table containing the link column
+        link_column_name: Name of the link column (e.g., "Supplier", "Ingredients")
+        link_column_row_id: Row ID in the link column table
+        target_table: Table being linked to
+        target_row_id: Row ID in the target table
+
+    Returns True on success.
+    """
+    try:
+        # Get the link ID for this column
+        link_id = base.get_column_link_id(link_column_table, link_column_name)
+        if not link_id:
+            print(f"[WARNING] Could not get link_id for {link_column_table}.{link_column_name}")
+            return False
+
+        # Add the link
+        base.add_link(
+            link_id,
+            link_column_table,
+            target_table,
+            link_column_row_id,
+            target_row_id,
+        )
+        print(f"[LOG] Added link: {link_column_table}({link_column_row_id}) → {target_table}({target_row_id})")
+        return True
+
+    except Exception as e:
+        print(f"[WARNING] Failed to add link: {e}")
+        return False
 
 
 def attach_invoice_file(
@@ -163,6 +220,41 @@ def update_sp_price(base: Base, sp_row_id: str, new_price: float) -> bool:
             return True  # Price History written, so don't fail the whole workflow
         print(f"[ERROR] Failed to update SP row {sp_row_id}: {e}")
         return False
+
+
+def link_supplier_product(
+    base: Base,
+    sp_row_id: str,
+    supplier_row_id: Optional[str] = None,
+    ingredient_row_id: Optional[str] = None,
+) -> Dict[str, bool]:
+    """
+    Link a Supplier Product to its Supplier and Ingredient.
+    Returns dict with results for each link.
+    """
+    results = {}
+
+    if supplier_row_id:
+        results["supplier"] = add_row_link(
+            base=base,
+            link_column_table=SUPPLIER_PRODUCTS_TABLE,
+            link_column_name="Supplier",
+            link_column_row_id=sp_row_id,
+            target_table="Suppliers",
+            target_row_id=supplier_row_id,
+        )
+
+    if ingredient_row_id:
+        results["ingredient"] = add_row_link(
+            base=base,
+            link_column_table=SUPPLIER_PRODUCTS_TABLE,
+            link_column_name="Ingredients",
+            link_column_row_id=sp_row_id,
+            target_table="Ingredients",
+            target_row_id=ingredient_row_id,
+        )
+
+    return results
 
 
 def mark_invoice_processed(base: Base, invoice_row_id: str) -> bool:
