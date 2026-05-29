@@ -136,35 +136,60 @@ def notify_tier4_items(invoice: dict, tier4_records: list, file_path: str) -> No
     print(f"[LOG] Sent {len(tier4_records)} tier4 alert(s) for invoice {invoice_num}")
 
 
-def notify_invoice_comparison(payload: dict) -> bool:
+def notify_invoice_comparison(payload: dict, _skip_setup_check: bool = False) -> bool:
     from step2_compare import format_telegram_message
     from approval_handler import save_pending, build_inline_keyboard
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    invoice_num = payload.get("invoice_number", "Unknown")
+    supplier_name = payload.get("supplier_name", "Unknown")
+
+    if not _skip_setup_check and not payload.get("supplier_matched", True):
+        from setup_handler import save_setup_state
+
+        unmatched = payload.get("unmatched_items", [])
+        items_state = [{
+            "product_name": u["product_name"],
+            "invoice_unit": u.get("invoice_unit"),
+            "invoice_unit_price": u.get("invoice_unit_price"),
+            "product_row_id": None,
+            "product_added": False,
+            "ingredient_row_id": None,
+            "ingredient_linked": False,
+            "status": "pending",
+        } for u in unmatched]
+
+        save_setup_state(invoice_num, {
+            "invoice_number": invoice_num,
+            "supplier_name": supplier_name,
+            "supplier_row_id": None,
+            "supplier_added": False,
+            "items": items_state,
+            "current_item_idx": 0,
+            "setup_step": "supplier",
+            "setup_complete": False,
+            "invoice_file_path": payload.get("invoice_file_path", ""),
+        })
+        save_pending(invoice_num, payload)
+
+        keyboard = [[
+            InlineKeyboardButton("Add Supplier", callback_data=f"add_supplier:{invoice_num}"),
+            InlineKeyboardButton("Skip", callback_data=f"skip_supplier:{invoice_num}"),
+        ]]
+        text = (
+            f"*Setup Required* — {invoice_num}\n"
+            f"Supplier: `{supplier_name}`\n"
+            f"Not found in Seatable.\n\n"
+            f"{len(items_state)} product(s) to set up after.\n\n"
+            f"Create this supplier?"
+        )
+        return _send_seatable(text, reply_markup=InlineKeyboardMarkup(keyboard).to_dict())
+
     msg = format_telegram_message(payload)
-    save_pending(payload["invoice_number"], payload)
+    save_pending(invoice_num, payload)
     keyboard = build_inline_keyboard(payload)
     markup = keyboard.to_dict() if keyboard else None
     return _send_seatable(msg, reply_markup=markup)
-
-
-def notify_missing_supplier(invoice_number: str, supplier_name: str, record_id: str, candidates: list, file_path: str) -> bool:
-    lines = [f"🏭 *Unknown supplier — {invoice_number}*\n"]
-    safe_name = supplier_name or "(no name)"
-    lines.append(f"Invoice says: `{safe_name}`")
-    if candidates:
-        lines.append("Closest matches:")
-        for i, c in enumerate(candidates[:5], 1):
-            score_pct = int(c.get("score", 0))
-            lines.append(f"  {i}\\. {c['name']} ({score_pct}%)")
-    else:
-        lines.append("_No close matches found._")
-    lines.append("")
-    lines.append(f"`newsupplier {record_id}` — create new")
-    lines.append(f"`linksupplier {record_id} <N>` — link to candidate N")
-    lines.append(f"`skipsupplier {record_id}` — skip")
-    lines.append(f"\n_File: {file_path}_")
-
-    print(f"[LOG] Sending missing supplier alert for invoice {invoice_number}")
-    return _send_seatable("\n".join(lines))
 
 
 def notify_cost_alert(text: str) -> bool:

@@ -63,6 +63,8 @@ SYSTEM_PROMPT = (
     '  "invoices": [\n'
     '    {\n'
     '      "supplier_name": "string or null",\n'
+    '      "supplier_brn": "string or null",\n'
+    '      "supplier_tax_id": "string or null",\n'
     '      "invoice_number": "string or null",\n'
     '      "do_number": "string or null",\n'
     '      "invoice_date": "YYYY-MM-DD or null",\n'
@@ -87,6 +89,12 @@ SYSTEM_PROMPT = (
     "- For dates use YYYY-MM-DD.\n"
     "- For numbers use numeric values, not strings.\n"
     "- If a field is missing or unreadable use null.\n"
+    "- supplier_brn: extract the supplier's Business Registration Number (BRN) or Company Registration "
+    "Number if visible. Look for labels: 'BRN:', 'Reg No:', 'SSM:', 'Co. No:', 'Company No:'. "
+    "Return null if not found.\n"
+    "- supplier_tax_id: extract the supplier's SST or Tax ID if visible. "
+    "Look for labels: 'SST No:', 'GST No:', 'Tax ID:', 'GST ID:', 'SST Reg No:'. "
+    "Return null if not found.\n"
     "- has_handwriting: set true ONLY for meaningful handwriting — words (English, Chinese, Malay), "
     "X marks, cross-outs, or handwritten numbers. "
     "Tick marks and checkmarks (✓ ✔) alone are NOT meaningful — set has_handwriting: false.\n"
@@ -194,6 +202,8 @@ def _parse_invoices(raw_invoices: list, raw_text: str = None) -> List[Dict[str, 
         flags: List[str] = []
 
         supplier_name = inv.get("supplier_name") or None
+        supplier_brn = inv.get("supplier_brn") or None
+        supplier_tax_id = inv.get("supplier_tax_id") or None
         invoice_number = inv.get("invoice_number") or None
         do_number = inv.get("do_number") or None
         invoice_date = inv.get("invoice_date") or None
@@ -221,6 +231,8 @@ def _parse_invoices(raw_invoices: list, raw_text: str = None) -> List[Dict[str, 
 
         invoice_obj = {
             "supplier_name": supplier_name,
+            "supplier_brn": supplier_brn,
+            "supplier_tax_id": supplier_tax_id,
             "invoice_number": invoice_number,
             "do_number": do_number,
             "invoice_date": invoice_date,

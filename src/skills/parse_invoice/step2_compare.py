@@ -37,7 +37,7 @@ SEATABLE_BASE_URL = os.getenv("SEATABLE_BASE_URL")
 AUTO_ACCEPT = 95
 CONFIRM = 80
 SHOW_CANDIDATES = 60
-SUPPLIER_THRESHOLD = 70
+SUPPLIER_THRESHOLD = 85
 
 # Magnitude safeguard
 PRICE_CHANGE_SANITY_CAP_PCT = 30.0
@@ -123,7 +123,28 @@ def _load_products(base: Base) -> List[Dict]:
     return _products_cache
 
 
-def _match_supplier(supplier_name: str, suppliers: List[Dict]) -> Optional[Dict]:
+def _match_supplier(
+    supplier_name: str,
+    suppliers: List[Dict],
+    brn: str = None,
+    tax_id: str = None,
+) -> Optional[Dict]:
+    # Exact match on BRN or Tax ID first — no fuzzy needed
+    if brn:
+        brn_clean = brn.strip().upper().replace(" ", "").replace("-", "")
+        for s in suppliers:
+            s_brn = (s.get("Business Reg No") or "").strip().upper().replace(" ", "").replace("-", "")
+            if s_brn and s_brn == brn_clean:
+                print(f"[LOG] Supplier matched via BRN: {brn} -> {s.get('Supplier Name')}")
+                return s
+    if tax_id:
+        tax_clean = tax_id.strip().upper().replace(" ", "").replace("-", "")
+        for s in suppliers:
+            s_tax = (s.get("Tax ID") or "").strip().upper().replace(" ", "").replace("-", "")
+            if s_tax and s_tax == tax_clean:
+                print(f"[LOG] Supplier matched via Tax ID: {tax_id} -> {s.get('Supplier Name')}")
+                return s
+    # Fall back to fuzzy name match
     names = [r.get("Supplier Name", "") for r in suppliers]
     norm_names = [_norm(n) for n in names]
     target = _norm(supplier_name)
@@ -175,10 +196,12 @@ def build_comparison(step1_result: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     for invoice in step1_result.get("invoices", []):
         supplier_name = invoice.get("supplier_name") or ""
+        supplier_brn = invoice.get("supplier_brn") or ""
+        supplier_tax_id = invoice.get("supplier_tax_id") or ""
         invoice_number = invoice.get("invoice_number") or ""
         invoice_date = invoice.get("invoice_date") or ""
 
-        matched_supplier = _match_supplier(supplier_name, suppliers)
+        matched_supplier = _match_supplier(supplier_name, suppliers, brn=supplier_brn, tax_id=supplier_tax_id)
         supplier_matched = matched_supplier is not None
         supplier_row_id = matched_supplier.get("_id", "") if supplier_matched else ""
 
@@ -216,24 +239,44 @@ def build_comparison(step1_result: Dict[str, Any]) -> List[Dict[str, Any]]:
             if not supplier_matched:
                 target = _norm(product_name)
                 top3 = process.extract(target, norm_all_product_names, scorer=fuzz.token_set_ratio, limit=3) if norm_all_product_names else []
-                unmatched_items.append({"product_name": product_name, "candidates": _make_candidates(top3)})
+                unmatched_items.append({
+                    "product_name": product_name,
+                    "invoice_unit": invoice_unit,
+                    "invoice_unit_price": float(invoice_unit_price) if invoice_unit_price is not None else None,
+                    "candidates": _make_candidates(top3)
+                })
                 continue
 
             if not product_names:
-                unmatched_items.append({"product_name": product_name, "candidates": []})
+                unmatched_items.append({
+                    "product_name": product_name,
+                    "invoice_unit": invoice_unit,
+                    "invoice_unit_price": float(invoice_unit_price) if invoice_unit_price is not None else None,
+                    "candidates": []
+                })
                 continue
 
             target = _norm(product_name)
             results = process.extract(target, norm_product_names, scorer=fuzz.token_set_ratio, limit=3)
 
             if not results:
-                unmatched_items.append({"product_name": product_name, "candidates": []})
+                unmatched_items.append({
+                    "product_name": product_name,
+                    "invoice_unit": invoice_unit,
+                    "invoice_unit_price": float(invoice_unit_price) if invoice_unit_price is not None else None,
+                    "candidates": []
+                })
                 continue
 
             top_score = results[0][1]
 
             if top_score < SHOW_CANDIDATES:
-                unmatched_items.append({"product_name": product_name, "candidates": _make_candidates(results)})
+                unmatched_items.append({
+                    "product_name": product_name,
+                    "invoice_unit": invoice_unit,
+                    "invoice_unit_price": float(invoice_unit_price) if invoice_unit_price is not None else None,
+                    "candidates": _make_candidates(results)
+                })
                 continue
 
             _, match_score, idx = results[0]

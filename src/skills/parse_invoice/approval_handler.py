@@ -115,7 +115,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_ref = f"{user.username or user.first_name}({user.id})"
 
     try:
-        action, invoice_num, target = query.data.split(":", 2)
+        parts = query.data.split(":", 2)
+        action = parts[0]
+        invoice_num = parts[1] if len(parts) > 1 else None
+    except (ValueError, IndexError):
+        await query.answer("Bad callback data", show_alert=True)
+        return
+
+    # Delegate setup callbacks to setup_handler
+    SETUP_ACTIONS = {"add_supplier", "skip_supplier", "add_product", "skip_product", "link_ingredient", "skip_ingredient"}
+    if action in SETUP_ACTIONS:
+        from setup_handler import handle_setup_callback
+        await handle_setup_callback(update, context)
+        return
+
+    # Parse approval callback (action, invoice_num, target)
+    try:
+        _, _, target = query.data.split(":", 2)
     except ValueError:
         await query.answer("Bad callback data", show_alert=True)
         return
