@@ -143,11 +143,20 @@ def notify_invoice_comparison(payload: dict, _skip_setup_check: bool = False) ->
 
     invoice_num = payload.get("invoice_number", "Unknown")
     supplier_name = payload.get("supplier_name", "Unknown")
+    supplier_matched = payload.get("supplier_matched", True)
+    supplier_row_id = payload.get("supplier_row_id", "")
+    unmatched = payload.get("unmatched_items", [])
 
-    if not _skip_setup_check and not payload.get("supplier_matched", True):
+    needs_supplier_setup = not _skip_setup_check and not supplier_matched
+    needs_product_setup = (
+        not _skip_setup_check
+        and supplier_matched
+        and bool(unmatched)
+    )
+
+    if needs_supplier_setup or needs_product_setup:
         from setup_handler import save_setup_state
 
-        unmatched = payload.get("unmatched_items", [])
         items_state = [{
             "product_name": u["product_name"],
             "invoice_unit": u.get("invoice_unit"),
@@ -159,30 +168,51 @@ def notify_invoice_comparison(payload: dict, _skip_setup_check: bool = False) ->
             "status": "pending",
         } for u in unmatched]
 
+        if needs_supplier_setup:
+            setup_step = "supplier"
+            supplier_added_flag = False
+            state_supplier_row_id = None
+            text = (
+                f"*Setup Required* — {invoice_num}\n"
+                f"Supplier: `{supplier_name}`\n"
+                f"Not found in Seatable.\n\n"
+                f"{len(items_state)} product(s) to set up after.\n\n"
+                f"Create this supplier?"
+            )
+            keyboard = [[
+                InlineKeyboardButton("Add Supplier", callback_data=f"add_supplier:{invoice_num}"),
+                InlineKeyboardButton("Skip", callback_data=f"skip_supplier:{invoice_num}"),
+            ]]
+        else:
+            setup_step = "product"
+            supplier_added_flag = True
+            state_supplier_row_id = supplier_row_id
+            first_product = items_state[0]["product_name"] if items_state else "(none)"
+            text = (
+                f"*Setup Required* — {invoice_num}\n"
+                f"Supplier: `{supplier_name}` (already in Seatable)\n\n"
+                f"{len(items_state)} unmatched product(s).\n"
+                f"Item 1/{len(items_state)}: {first_product}\n\n"
+                f"Create this product?"
+            )
+            keyboard = [[
+                InlineKeyboardButton("Add Product", callback_data=f"add_product:{invoice_num}"),
+                InlineKeyboardButton("Skip", callback_data=f"skip_product:{invoice_num}"),
+            ]]
+
         save_setup_state(invoice_num, {
             "invoice_number": invoice_num,
             "supplier_name": supplier_name,
-            "supplier_row_id": None,
-            "supplier_added": False,
+            "supplier_row_id": state_supplier_row_id,
+            "supplier_added": supplier_added_flag,
             "items": items_state,
             "current_item_idx": 0,
-            "setup_step": "supplier",
+            "setup_step": setup_step,
             "setup_complete": False,
             "invoice_file_path": payload.get("invoice_file_path", ""),
+            "original_payload": payload,
         })
         save_pending(invoice_num, payload)
-
-        keyboard = [[
-            InlineKeyboardButton("Add Supplier", callback_data=f"add_supplier:{invoice_num}"),
-            InlineKeyboardButton("Skip", callback_data=f"skip_supplier:{invoice_num}"),
-        ]]
-        text = (
-            f"*Setup Required* — {invoice_num}\n"
-            f"Supplier: `{supplier_name}`\n"
-            f"Not found in Seatable.\n\n"
-            f"{len(items_state)} product(s) to set up after.\n\n"
-            f"Create this supplier?"
-        )
         return _send_seatable(text, reply_markup=InlineKeyboardMarkup(keyboard).to_dict())
 
     msg = format_telegram_message(payload)

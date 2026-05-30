@@ -87,6 +87,13 @@ _suppliers_cache: Optional[List[Dict]] = None
 _products_cache: Optional[List[Dict]] = None
 
 
+def clear_caches() -> None:
+    """Invalidate cached suppliers/products. Call after writing new rows."""
+    global _suppliers_cache, _products_cache
+    _suppliers_cache = None
+    _products_cache = None
+
+
 def _seatable_base() -> Base:
     base = Base(SEATABLE_API_TOKEN, SEATABLE_BASE_URL)
     base.auth()

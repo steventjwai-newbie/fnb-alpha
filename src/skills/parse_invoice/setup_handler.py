@@ -120,17 +120,18 @@ def _send_ingredient_prompt(query, state: Dict[str, Any], invoice_num: str,
 
 
 def _build_approval_payload(state: Dict[str, Any], original_payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Build synthetic payload with new products in confirm_items, supplier_matched=True."""
-    payload = original_payload.copy()
+    """Build payload merging original matched/changed items with newly-created products."""
+    payload = dict(original_payload)
     payload["supplier_matched"] = True
     payload["supplier_row_id"] = state["supplier_row_id"]
 
-    confirm_items = []
+    new_confirm = []
     for item in state["items"]:
-        if item["status"] == "skipped":
+        if item.get("status") == "skipped":
             continue
-
-        confirm_items.append({
+        if not item.get("product_row_id"):
+            continue
+        new_confirm.append({
             "product_name": item["product_name"],
             "sp_row_id": item["product_row_id"],
             "sp_code": f"SP-{item['product_row_id'][:8]}",
@@ -141,8 +142,8 @@ def _build_approval_payload(state: Dict[str, Any], original_payload: Dict[str, A
             "invoice_unit_price": item["invoice_unit_price"],
         })
 
-    payload["confirm_items"] = confirm_items
-    payload["price_changes"] = []
+    payload["price_changes"] = list(original_payload.get("price_changes", []))
+    payload["confirm_items"] = list(original_payload.get("confirm_items", [])) + new_confirm
     payload["unmatched_items"] = []
 
     return payload
@@ -217,6 +218,9 @@ async def handle_setup_callback(update: Update, context: ContextTypes.DEFAULT_TY
             state["supplier_added"] = True
             save_setup_state(invoice_num, state)
 
+            from step2_compare import clear_caches
+            clear_caches()
+
             new_text = f"[OK] Supplier '{supplier_name}' created."
             await _advance_to_next_item_or_finish(query, state, invoice_num, base, new_text)
         except Exception as e:
@@ -249,6 +253,9 @@ async def handle_setup_callback(update: Update, context: ContextTypes.DEFAULT_TY
             item["product_row_id"] = product_row_id
             item["product_added"] = True
             save_setup_state(invoice_num, state)
+
+            from step2_compare import clear_caches
+            clear_caches()
 
             new_text = f"[OK] Product '{product_name}' created."
             candidates = _search_ingredients(base, product_name)
