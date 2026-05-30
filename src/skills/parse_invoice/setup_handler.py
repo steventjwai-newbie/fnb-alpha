@@ -272,6 +272,16 @@ async def handle_setup_callback(update: Update, context: ContextTypes.DEFAULT_TY
             row = base.append_row("Supplier Products", row_data)
             product_row_id = row["_id"]
 
+            from seatable_writer import add_row_link
+            add_row_link(
+                base=base,
+                link_column_table="Supplier Products",
+                link_column_name="Supplier",
+                link_column_row_id=product_row_id,
+                target_table="Suppliers",
+                target_row_id=supplier_row_id,
+            )
+
             item["product_row_id"] = product_row_id
             item["product_added"] = True
             save_setup_state(invoice_num, state)

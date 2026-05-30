@@ -176,29 +176,41 @@ def write_price_history(
         "Change %": round(change_pct, 2),
         "Flagged By": flagged_by,
     }
-    # Add optional link columns if they exist
-    if sp_row_id:
-        row_payload["Supplier product (link)"] = [sp_row_id]
-    if invoice_row_id:
-        row_payload["Invoice Reference"] = [invoice_row_id]
 
     try:
-        base.append_row(PRICE_HISTORY_TABLE, row_payload)
-        return True
+        row = base.append_row(PRICE_HISTORY_TABLE, row_payload)
+        history_row_id = row.get("_id") if isinstance(row, dict) else None
     except Exception as e:
-        # If link columns don't exist, try again without them
-        if "link" in str(e).lower() or "not found" in str(e).lower():
-            print(f"[WARNING] Price History link columns unavailable, writing without links")
-            row_payload.pop("Supplier product (link)", None)
-            row_payload.pop("Invoice Reference", None)
-            try:
-                base.append_row(PRICE_HISTORY_TABLE, row_payload)
-                return True
-            except Exception as e2:
-                print(f"[ERROR] Failed to write Price History row (retry): {e2}")
-                return False
         print(f"[ERROR] Failed to write Price History row: {e}")
         return False
+
+    if history_row_id and sp_row_id:
+        try:
+            add_row_link(
+                base=base,
+                link_column_table=PRICE_HISTORY_TABLE,
+                link_column_name="Supplier product (link)",
+                link_column_row_id=history_row_id,
+                target_table=SUPPLIER_PRODUCTS_TABLE,
+                target_row_id=sp_row_id,
+            )
+        except Exception as e:
+            print(f"[WARNING] Could not link Price History → SP: {e}")
+
+    if history_row_id and invoice_row_id:
+        try:
+            add_row_link(
+                base=base,
+                link_column_table=PRICE_HISTORY_TABLE,
+                link_column_name="Invoice Reference",
+                link_column_row_id=history_row_id,
+                target_table=INVOICES_TABLE,
+                target_row_id=invoice_row_id,
+            )
+        except Exception as e:
+            print(f"[WARNING] Could not link Price History → Invoice: {e}")
+
+    return True
 
 
 def update_sp_price(base: Base, sp_row_id: str, new_price: float) -> bool:
