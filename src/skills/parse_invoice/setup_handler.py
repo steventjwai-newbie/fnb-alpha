@@ -70,7 +70,7 @@ def _search_ingredients(base, query: str) -> List[Dict[str, Any]]:
     return candidates[:3]
 
 
-def _send_product_prompt(query, state: Dict[str, Any], invoice_num: str, prefix_text: str) -> None:
+async def _send_product_prompt(query, state: Dict[str, Any], invoice_num: str, prefix_text: str) -> None:
     """Edit message to: Create product 'X'? [Add Product] [Skip]"""
     item = state["items"][state["current_item_idx"]]
     product_name = item["product_name"]
@@ -88,13 +88,13 @@ def _send_product_prompt(query, state: Dict[str, Any], invoice_num: str, prefix_
     ]]
 
     try:
-        query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception as e:
         print(f"[ERROR] Failed to edit message: {e}")
 
 
-def _send_ingredient_prompt(query, state: Dict[str, Any], invoice_num: str,
-                           product_name: str, candidates: List[Dict], prefix_text: str) -> None:
+async def _send_ingredient_prompt(query, state: Dict[str, Any], invoice_num: str,
+                                  product_name: str, candidates: List[Dict], prefix_text: str) -> None:
     """Edit message with up to 3 ingredient buttons + [Skip]."""
     keyboard = []
     for cand in candidates:
@@ -114,7 +114,7 @@ def _send_ingredient_prompt(query, state: Dict[str, Any], invoice_num: str,
     )
 
     try:
-        query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception as e:
         print(f"[ERROR] Failed to edit message: {e}")
 
@@ -133,13 +133,17 @@ def _build_approval_payload(state: Dict[str, Any], original_payload: Dict[str, A
             continue
         new_confirm.append({
             "product_name": item["product_name"],
+            "seatable_product": item["product_name"],
             "sp_row_id": item["product_row_id"],
             "sp_code": f"SP-{item['product_row_id'][:8]}",
             "matched_product_name": item["product_name"],
+            "match_score": 100,
             "old_price": 0,
-            "new_price": item["invoice_unit_price"],
-            "invoice_unit": item["invoice_unit"],
-            "invoice_unit_price": item["invoice_unit_price"],
+            "new_price": item.get("invoice_unit_price") or 0,
+            "unit": item.get("invoice_unit") or "",
+            "invoice_unit": item.get("invoice_unit"),
+            "invoice_unit_price": item.get("invoice_unit_price"),
+            "diff_pct": "N/A",
         })
 
     payload["price_changes"] = list(original_payload.get("price_changes", []))
@@ -156,7 +160,7 @@ async def _advance_to_next_item_or_finish(query, state: Dict[str, Any], invoice_
 
     if state["current_item_idx"] < len(state["items"]):
         save_setup_state(invoice_num, state)
-        _send_product_prompt(query, state, invoice_num, new_text)
+        await _send_product_prompt(query, state, invoice_num, new_text)
     else:
         from approval_handler import load_pending
         from notifier import notify_invoice_comparison
@@ -178,7 +182,7 @@ async def _advance_to_next_item_or_finish(query, state: Dict[str, Any], invoice_
         notify_invoice_comparison(approval_payload, _skip_setup_check=True)
 
         try:
-            query.edit_message_text(new_text + "\n\n[OK] Setup complete — sending approval buttons...")
+            await query.edit_message_text(new_text + "\n\n[OK] Setup complete — sending approval buttons...")
         except:
             pass
 
@@ -209,6 +213,11 @@ async def handle_setup_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     if action == "add_supplier":
         supplier_name = state["supplier_name"]
+        if state.get("supplier_added") and state.get("supplier_row_id"):
+            new_text = f"[INFO] Supplier '{supplier_name}' already created."
+            if state["items"]:
+                await _send_product_prompt(query, state, invoice_num, new_text)
+            return
         try:
             row_data = {"Supplier Name": supplier_name}
             row = base.append_row("Suppliers", row_data)
@@ -216,13 +225,17 @@ async def handle_setup_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
             state["supplier_row_id"] = supplier_row_id
             state["supplier_added"] = True
+            state["setup_step"] = "product"
             save_setup_state(invoice_num, state)
 
             from step2_compare import clear_caches
             clear_caches()
 
             new_text = f"[OK] Supplier '{supplier_name}' created."
-            await _advance_to_next_item_or_finish(query, state, invoice_num, base, new_text)
+            if state["items"]:
+                await _send_product_prompt(query, state, invoice_num, new_text)
+            else:
+                await _advance_to_next_item_or_finish(query, state, invoice_num, base, new_text)
         except Exception as e:
             try:
                 await query.edit_message_text(f"[ERROR] Failed to create supplier: {e}")
@@ -240,6 +253,15 @@ async def handle_setup_callback(update: Update, context: ContextTypes.DEFAULT_TY
         item = state["items"][state["current_item_idx"]]
         product_name = item["product_name"]
         supplier_row_id = state["supplier_row_id"]
+
+        if item.get("product_added") and item.get("product_row_id"):
+            new_text = f"[INFO] Product '{product_name}' already created."
+            candidates = _search_ingredients(base, product_name)
+            if candidates:
+                await _send_ingredient_prompt(query, state, invoice_num, product_name, candidates, new_text)
+            else:
+                await _advance_to_next_item_or_finish(query, state, invoice_num, base, new_text)
+            return
 
         try:
             row_data = {

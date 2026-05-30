@@ -17,7 +17,18 @@
       "Read(//tmp/**)",
       "Bash(git commit *)",
       "Bash(PYTHONIOENCODING=utf-8 python *)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(tasklist *)",
+      "Bash(wmic process *)",
+      "Bash(powershell.exe *)",
+      "Bash(taskkill //PID 23708 //F)",
+      "Bash(taskkill //PID 24948 //F)",
+      "Bash(echo \"intake_listener started in background, PID: $!\")",
+      "Bash(echo \"approval_handler started in background, PID: $!\")",
+      "Bash(disown)",
+      "Bash(echo \"intake_listener PID: $!\")",
+      "Bash(echo \"approval_handler PID: $!\")",
+      "Bash(git *)"
     ]
   }
 }
