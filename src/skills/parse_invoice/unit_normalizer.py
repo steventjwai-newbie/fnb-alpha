@@ -33,6 +33,20 @@ STANDARD: dict[str, tuple[str, Decimal]] = {
     "liter":      ("ml",   Decimal("1000")),
     "litres":     ("ml",   Decimal("1000")),
     "liters":     ("ml",   Decimal("1000")),
+    # Imperial mass (base: gram)
+    "lb":         ("gram", Decimal("453.592")),
+    "lbs":        ("gram", Decimal("453.592")),
+    "pound":      ("gram", Decimal("453.592")),
+    "pounds":     ("gram", Decimal("453.592")),
+    "oz":         ("gram", Decimal("28.3495")),
+    "ounce":      ("gram", Decimal("28.3495")),
+    "ounces":     ("gram", Decimal("28.3495")),
+    # Imperial volume (base: ml)
+    "gal":        ("ml",   Decimal("3785.41")),
+    "gallon":     ("ml",   Decimal("3785.41")),
+    "gallons":    ("ml",   Decimal("3785.41")),
+    "floz":       ("ml",   Decimal("29.5735")),
+    "fl oz":      ("ml",   Decimal("29.5735")),
 }
 
 

@@ -123,10 +123,60 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Delegate setup callbacks to setup_handler
-    SETUP_ACTIONS = {"add_supplier", "skip_supplier", "add_product", "skip_product", "link_ingredient", "skip_ingredient"}
+    SETUP_ACTIONS = {
+        "add_supplier", "skip_supplier",
+        "add_product", "skip_product",
+        "link_ingredient", "skip_ingredient",
+        "link_existing_product", "create_ingredient",
+    }
     if action in SETUP_ACTIONS:
         from setup_handler import handle_setup_callback
         await handle_setup_callback(update, context)
+        return
+
+    # Backfill pack info callbacks
+    if action in ("backfill_pack", "backfill_skip"):
+        sp_row_id = invoice_num  # second field reused as sp_row_id
+        backfill_dir = PENDING_DIR.parent / "backfill_pending"
+        pending_path = backfill_dir / f"{sp_row_id}.json"
+
+        if action == "backfill_skip":
+            if pending_path.exists():
+                pending_path.unlink()
+            try:
+                await query.edit_message_text(query.message.text + f"\n\n⏭ {user_ref}: skipped")
+            except Exception:
+                pass
+            return
+
+        # action == "backfill_pack"
+        if not pending_path.exists():
+            await query.edit_message_text(query.message.text + "\n\n❌ Backfill data missing.")
+            return
+
+        import json as _json
+        with open(pending_path, encoding="utf-8") as f:
+            bp = _json.load(f)
+
+        update_payload = {}
+        if bp.get("pack_size"):
+            update_payload["Pack Size"] = bp["pack_size"]
+        if bp.get("unit_quantity") is not None:
+            update_payload["Unit Quantity"] = bp["unit_quantity"]
+        if bp.get("unit_of_measure"):
+            update_payload["Unit of Measure"] = bp["unit_of_measure"]
+
+        try:
+            from seatable_writer import _base as _sw_base
+            base = _sw_base()
+            base.update_row("Supplier Products", sp_row_id, update_payload)
+            pending_path.unlink()
+            result_text = ", ".join(f"{k}={v}" for k, v in update_payload.items())
+            await query.edit_message_text(
+                query.message.text + f"\n\n✓ {user_ref}: applied — {result_text}"
+            )
+        except Exception as e:
+            await query.edit_message_text(query.message.text + f"\n\n❌ Failed: {e}")
         return
 
     # Parse approval callback (action, invoice_num, target)

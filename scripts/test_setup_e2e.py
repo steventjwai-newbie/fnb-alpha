@@ -278,13 +278,25 @@ async def main():
                   supplier_row_id in sup_link_ids,
                   f"links={sup_link_ids}")
 
+    # ── T4.6: Verify pack fields populated on the new SP ──
+    print("\n── T4.6: Verify pack fields on newly created SP ──")
+    if product_row_id:
+        sp_row = get_sp_by_id(product_row_id)
+        if sp_row:
+            pack_size = sp_row.get("Pack Size")
+            unit_qty = sp_row.get("Unit Quantity")
+            unit_uom = sp_row.get("Unit of Measure")
+            check("T4.6 pack fields populated (at least Pack Size or Unit Qty+UoM)",
+                  bool(pack_size) or (unit_qty is not None and bool(unit_uom)),
+                  f"Pack Size={pack_size!r}, Unit Qty={unit_qty}, UoM={unit_uom!r}")
+
     # ── T4: LLM ingredient match and link/create ──
     print("\n── T4: LLM ingredient match and simulate callback ──")
-    from setup_handler import _search_ingredients, _llm_match_ingredient
+    from setup_handler import _search_ingredients, _llm_classify_sp
     base = get_base()
     product_name = state["items"][0]["product_name"]
     candidates = _search_ingredients(base, product_name)
-    llm_result = _llm_match_ingredient(product_name, candidates)
+    llm_result = _llm_classify_sp(product_name, candidates)
     match_id = llm_result.get("match_row_id")
     suggested = llm_result.get("suggested_name") or product_name
     check("T4.1 LLM ingredient call succeeded", bool(suggested),

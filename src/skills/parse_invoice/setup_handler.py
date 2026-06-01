@@ -70,9 +70,21 @@ def _search_ingredients(base, query: str, limit: int = 50) -> List[Dict[str, Any
     return candidates[:limit]
 
 
-def _llm_match_ingredient(sp_name: str, candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Single Gemini call: match SP name to ingredient or suggest a canonical name.
-    Returns {"match_row_id": str|None, "match_name": str|None, "suggested_name": str}
+def _llm_classify_sp(
+    sp_name: str,
+    candidates: List[Dict[str, Any]],
+    invoice_unit: str = None,
+    invoice_unit_price=None,
+) -> Dict[str, Any]:
+    """Single Gemini call: classify a supplier product.
+
+    Returns ingredient match + pack metadata:
+    {
+      "match_row_id": str|None, "match_name": str|None, "suggested_name": str,
+      "whole_piece": bool,
+      "pack_size": str|None, "unit_quantity": float|None, "unit_of_measure": str|None,
+      "pack_reasoning": str
+    }
     """
     import os, json
     from google import genai
@@ -85,15 +97,35 @@ def _llm_match_ingredient(sp_name: str, candidates: List[Dict[str, Any]]) -> Dic
         f"  id={c['row_id']} | {c['name']}" for c in candidates
     ) if candidates else "  (none)"
 
+    invoice_ctx = ""
+    if invoice_unit or invoice_unit_price is not None:
+        parts = []
+        if invoice_unit:
+            parts.append(f"unit={invoice_unit}")
+        if invoice_unit_price is not None:
+            parts.append(f"unit_price={invoice_unit_price}")
+        invoice_ctx = f"\nInvoice context: {', '.join(parts)}"
+
     prompt = (
-        f"Malaysian cafe ingredient classifier.\n\n"
-        f"Supplier product: {sp_name}\n\n"
+        f"Malaysian cafe supplier product classifier.\n\n"
+        f"Supplier product: {sp_name}{invoice_ctx}\n\n"
         f"Ingredient table candidates:\n{candidate_lines}\n\n"
-        f"Match this supplier product to the correct ingredient if one fits well, "
-        f"else return null for match fields. "
-        f"Always return a short canonical ingredient name (e.g. 'Smoked Salmon', not the full supplier product name).\n\n"
+        f"Tasks:\n"
+        f"1. Match ingredient: pick best candidate if it fits well, else return null for match fields. "
+        f"Always return a short canonical ingredient name (e.g. 'Smoked Salmon').\n"
+        f"2. Pack info: extract pack_size (free-text like '10KG/CTN', '12X1L'), "
+        f"unit_quantity (the numeric selling quantity), unit_of_measure (g/kg/ml/l/lb/oz/gal/floz — lowercase). "
+        f"Use invoice context to resolve carton-vs-unit ambiguity. "
+        f"Imperial units (lb=453.592g, oz=28.3495g, gal=3785.41ml, floz=29.5735ml) are valid.\n"
+        f"3. whole_piece: true ONLY if this item is always sold/served as one indivisible unit "
+        f"(e.g. a burrata ball, an individual cake, a whole fish, a single-serve portion pack). "
+        f"Bulk commodities like salmon fillets, cream, flour, butter blocks are NOT whole_piece. "
+        f"When whole_piece=true: set unit_quantity=1 and unit_of_measure to the container word (tub/pcs/btl).\n\n"
         f"Return ONLY valid JSON:\n"
-        f'{{"match_row_id": "string or null", "match_name": "string or null", "suggested_name": "string"}}'
+        f'{{"match_row_id": "string or null", "match_name": "string or null", '
+        f'"suggested_name": "string", "whole_piece": false, '
+        f'"pack_size": "string or null", "unit_quantity": null, '
+        f'"unit_of_measure": "string or null", "pack_reasoning": "string"}}'
     )
 
     import time
@@ -105,14 +137,20 @@ def _llm_match_ingredient(sp_name: str, candidates: List[Dict[str, Any]]) -> Dic
                 config=types.GenerateContentConfig(response_mime_type="application/json"),
             )
             result = json.loads(response.text.strip())
-            if "suggested_name" not in result or not result["suggested_name"]:
+            if not result.get("suggested_name"):
                 result["suggested_name"] = sp_name
+            if result.get("whole_piece") and not result.get("unit_quantity"):
+                result["unit_quantity"] = 1
             return result
         except Exception as e:
-            print(f"[ERROR] LLM ingredient match failed (attempt {attempt + 1}/3): {e}")
+            print(f"[ERROR] LLM SP classify failed (attempt {attempt + 1}/3): {e}")
             if attempt < 2:
                 time.sleep(10)
-    return {"match_row_id": None, "match_name": None, "suggested_name": sp_name}
+    return {
+        "match_row_id": None, "match_name": None, "suggested_name": sp_name,
+        "whole_piece": False, "pack_size": None, "unit_quantity": None,
+        "unit_of_measure": None, "pack_reasoning": "LLM failed",
+    }
 
 
 def _search_sps_by_name(base, query: str, supplier_row_id: str = None) -> List[Dict[str, Any]]:
@@ -151,19 +189,39 @@ def _search_sps_by_name(base, query: str, supplier_row_id: str = None) -> List[D
 
 async def _send_product_prompt(query, state: Dict[str, Any], invoice_num: str, prefix_text: str,
                                 base=None) -> None:
-    """Edit message to: Create product 'X'? [Link Existing?] [Add Product] [Skip]"""
+    """Edit message to: Create product 'X'? [pack info] [Link Existing?] [Add Product] [Skip]"""
     item = state["items"][state["current_item_idx"]]
     product_name = item["product_name"]
 
+    # LLM classification — cache on state item so add_product handler reuses it
+    llm_result = item.get("llm_classification")
+    if not llm_result and base:
+        candidates = _search_ingredients(base, product_name)
+        llm_result = _llm_classify_sp(
+            product_name, candidates,
+            invoice_unit=item.get("invoice_unit"),
+            invoice_unit_price=item.get("invoice_unit_price"),
+        )
+        item["llm_classification"] = llm_result
+        save_setup_state(invoice_num, state)
+
+    # Build pack preview lines
+    pack_lines = []
+    if llm_result:
+        if llm_result.get("pack_size"):
+            pack_lines.append(f"  Pack: {llm_result['pack_size']}")
+        if llm_result.get("unit_quantity") is not None and llm_result.get("unit_of_measure"):
+            pack_lines.append(f"  Unit: {llm_result['unit_quantity']} {llm_result['unit_of_measure']}")
+
+    pack_str = ("\n" + "\n".join(pack_lines)) if pack_lines else ""
     text = (
         f"{prefix_text}\n"
         f"Item {state['current_item_idx'] + 1}/{len(state['items'])}: {product_name}\n"
-        f"Supplier: {state['supplier_name']}\n"
+        f"Supplier: {state['supplier_name']}{pack_str}\n"
         f"Create this product?"
     )
 
     keyboard = []
-
     if base:
         supplier_row_id = state.get("supplier_row_id")
         existing = _search_sps_by_name(base, product_name, supplier_row_id=supplier_row_id)
@@ -351,10 +409,18 @@ async def handle_setup_callback(update: Update, context: ContextTypes.DEFAULT_TY
         product_name = item["product_name"]
         supplier_row_id = state["supplier_row_id"]
 
+        # Use cached LLM classification (set by _send_product_prompt) or call now
+        llm_result = item.get("llm_classification")
+        if not llm_result:
+            candidates = _search_ingredients(base, product_name)
+            llm_result = _llm_classify_sp(
+                product_name, candidates,
+                invoice_unit=item.get("invoice_unit"),
+                invoice_unit_price=item.get("invoice_unit_price"),
+            )
+
         if item.get("product_added") and item.get("product_row_id"):
             new_text = f"[INFO] Product '{product_name}' already created."
-            candidates = _search_ingredients(base, product_name)
-            llm_result = _llm_match_ingredient(product_name, candidates)
             await _send_ingredient_prompt_llm(query, state, invoice_num, product_name, llm_result, new_text)
             return
 
@@ -364,6 +430,13 @@ async def handle_setup_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 "Supplier": [supplier_row_id],
                 "Active Status": "Active",
             }
+            if llm_result.get("pack_size"):
+                row_data["Pack Size"] = llm_result["pack_size"]
+            if llm_result.get("unit_quantity") is not None:
+                row_data["Unit Quantity"] = llm_result["unit_quantity"]
+            if llm_result.get("unit_of_measure"):
+                row_data["Unit of Measure"] = llm_result["unit_of_measure"]
+
             row = base.append_row("Supplier Products", row_data)
             product_row_id = row["_id"]
 
@@ -384,9 +457,14 @@ async def handle_setup_callback(update: Update, context: ContextTypes.DEFAULT_TY
             from step2_compare import clear_caches
             clear_caches()
 
-            new_text = f"[OK] Product '{product_name}' created."
-            candidates = _search_ingredients(base, product_name)
-            llm_result = _llm_match_ingredient(product_name, candidates)
+            pack_parts = []
+            if llm_result.get("pack_size"):
+                pack_parts.append(f"Pack: {llm_result['pack_size']}")
+            if llm_result.get("unit_quantity") is not None and llm_result.get("unit_of_measure"):
+                pack_parts.append(f"Unit: {llm_result['unit_quantity']} {llm_result['unit_of_measure']}")
+            pack_suffix = f" ({', '.join(pack_parts)})" if pack_parts else ""
+            new_text = f"[OK] Product '{product_name}' created.{pack_suffix}"
+
             await _send_ingredient_prompt_llm(query, state, invoice_num, product_name, llm_result, new_text)
         except Exception as e:
             try:
@@ -463,8 +541,14 @@ async def handle_setup_callback(update: Update, context: ContextTypes.DEFAULT_TY
             clear_caches()
 
             new_text = f"[OK] Linked existing product '{product_name}'."
-            candidates = _search_ingredients(base, product_name)
-            llm_result = _llm_match_ingredient(product_name, candidates)
+            llm_result = item.get("llm_classification")
+            if not llm_result:
+                candidates = _search_ingredients(base, product_name)
+                llm_result = _llm_classify_sp(
+                    product_name, candidates,
+                    invoice_unit=item.get("invoice_unit"),
+                    invoice_unit_price=item.get("invoice_unit_price"),
+                )
             await _send_ingredient_prompt_llm(query, state, invoice_num, product_name, llm_result, new_text)
         except Exception as e:
             try:
