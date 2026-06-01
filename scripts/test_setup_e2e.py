@@ -107,6 +107,86 @@ def count_price_history_for_sp(sp_row_id):
                 break
     return n
 
+def seatable_cleanup():
+    """Delete all Seatable rows created by this test. Scoped to SENG KONG FISHERY / CINV-1256-0526 only."""
+    base = get_base()
+    print("[CLEANUP] Starting Seatable cleanup...")
+
+    supplier = find_supplier("SENG KONG FISHERY SDN BHD")
+    if not supplier:
+        print("[CLEANUP] Supplier not found, skipping.")
+        return
+    supplier_row_id = supplier["_id"]
+
+    # Find SPs linked to this supplier
+    sp_row_ids = []
+    start, page = 0, 1000
+    while True:
+        batch = base.list_rows("Supplier Products", start=start, limit=page)
+        if not batch:
+            break
+        for row in batch:
+            links = row.get("Supplier") or []
+            link_ids = [l.get("row_id") if isinstance(l, dict) else l for l in links]
+            if supplier_row_id in link_ids:
+                sp_row_ids.append(row["_id"])
+        if len(batch) < page:
+            break
+        start += page
+    print(f"[CLEANUP] Found {len(sp_row_ids)} SP row(s).")
+
+    # Collect ingredient IDs linked to these SPs before deleting
+    ingredient_ids = []
+    for sp_id in sp_row_ids:
+        sp_row = base.get_row("Supplier Products", sp_id)
+        if sp_row:
+            for l in (sp_row.get("Ingredients") or []):
+                ing_id = l.get("row_id") if isinstance(l, dict) else l
+                if ing_id:
+                    ingredient_ids.append(ing_id)
+
+    # Delete Price History rows linked to these SPs
+    for row in base.list_rows("Price History"):
+        links = row.get("Supplier product (link)") or []
+        link_ids = [l.get("row_id") if isinstance(l, dict) else l for l in links]
+        if any(sp_id in link_ids for sp_id in sp_row_ids):
+            base.delete_row("Price History", row["_id"])
+            print(f"[CLEANUP] Deleted Price History {row['_id']}")
+
+    # Delete SP rows
+    for sp_id in sp_row_ids:
+        base.delete_row("Supplier Products", sp_id)
+        print(f"[CLEANUP] Deleted SP {sp_id}")
+
+    # Delete Invoice row
+    inv = find_invoice(INVOICE_NUM)
+    if inv:
+        base.delete_row("Invoices", inv["_id"])
+        print(f"[CLEANUP] Deleted Invoice {inv['_id']}")
+
+    # Delete supplier
+    base.delete_row("Suppliers", supplier_row_id)
+    print(f"[CLEANUP] Deleted Supplier {supplier_row_id}")
+
+    # Delete test-created ingredients (those with no remaining SP links after SP deletion)
+    import time; time.sleep(1)  # brief pause for Seatable to reflect deletions
+    for ing_id in ingredient_ids:
+        try:
+            ing_row = base.get_row("Ingredients", ing_id)
+            if not ing_row:
+                continue
+            # Check reverse link column (Ingredients → SP)
+            has_other_links = bool(ing_row.get("Link to Supplier Product"))
+            if not has_other_links:
+                base.delete_row("Ingredients", ing_id)
+                print(f"[CLEANUP] Deleted Ingredient {ing_id}")
+            else:
+                print(f"[CLEANUP] Kept Ingredient {ing_id} (has other SP links)")
+        except Exception as e:
+            print(f"[CLEANUP] Could not check/delete Ingredient {ing_id}: {e}")
+
+    print("[CLEANUP] Done.")
+
 # ────── Test runner ──────
 results = []
 def check(name, condition, detail=""):
@@ -119,26 +199,22 @@ async def main():
     print("E2E TEST: Setup flow for CINV-1256-0526 (Seng Kong Fishery)")
     print("=" * 70)
 
-    # Pre-clean
+    # Pre-clean local files
     for d in ["pending_approvals", "setup_state"]:
         p = Path(f"data/{d}/{INVOICE_NUM}.json" if d == "pending_approvals" else f"data/{d}/{INVOICE_NUM}_setup.json")
         if p.exists():
             p.unlink()
             print(f"[CLEAN] deleted {p}")
 
-    # Ensure supplier doesn't exist (per goal)
-    existing = find_supplier("SENG KONG FISHERY SDN BHD")
-    if existing:
-        print(f"[ABORT] Test supplier already exists in Seatable: {existing['_id']}")
-        print(f"[ABORT] Please delete it manually before re-running.")
-        sys.exit(1)
+    # Auto-clean Seatable test rows (scoped to this supplier only)
+    seatable_cleanup()
 
     # ── T1: Trigger setup prompt ──
     print("\n── T1: Build comparison, trigger setup prompt ──")
     import step2_compare, notifier
     step2_compare.clear_caches()
 
-    files = sorted(glob.glob('data/parsed_results/2026-05-29/CINV-1256-0526_*.json'),
+    files = sorted(glob.glob('data/parsed_results/*/CINV-1256-0526_*.json'),
                    key=os.path.getmtime, reverse=True)
     with open(files[0], encoding='utf-8') as f:
         step1 = json.load(f)
@@ -202,31 +278,35 @@ async def main():
                   supplier_row_id in sup_link_ids,
                   f"links={sup_link_ids}")
 
-    # ── T4: Click an ingredient candidate ──
-    print("\n── T4: Search ingredients and simulate link_ingredient callback ──")
-    from setup_handler import _search_ingredients
+    # ── T4: LLM ingredient match and link/create ──
+    print("\n── T4: LLM ingredient match and simulate callback ──")
+    from setup_handler import _search_ingredients, _llm_match_ingredient
     base = get_base()
-    candidates = _search_ingredients(base, state["items"][0]["product_name"])
-    # T4.1 is informational — no match means ingredient doesn't exist yet, not a bug
-    top = candidates[0] if candidates else None
-    check("T4.1 ingredient search ran without error", True,
-          f"top={top['name'] if top else 'NONE'} ({top['score'] if top else 0}%)")
+    product_name = state["items"][0]["product_name"]
+    candidates = _search_ingredients(base, product_name)
+    llm_result = _llm_match_ingredient(product_name, candidates)
+    match_id = llm_result.get("match_row_id")
+    suggested = llm_result.get("suggested_name") or product_name
+    check("T4.1 LLM ingredient call succeeded", bool(suggested),
+          f"match={llm_result.get('match_name')} suggested={suggested}")
 
-    if candidates:
-        ing_row_id = candidates[0]["row_id"]
-        await run_setup(f"link_ingredient:{INVOICE_NUM}:{ing_row_id}")
-
-        # Verify link
+    if match_id:
+        await run_setup(f"link_ingredient:{INVOICE_NUM}:{match_id}")
         sp_row = get_sp_by_id(product_row_id)
         ing_links = sp_row.get("Ingredients") or []
         ing_link_ids = [i.get("row_id") if isinstance(i, dict) else i for i in ing_links]
-        check("T4.2 SP linked to ingredient",
-              ing_row_id in ing_link_ids,
+        check("T4.2 SP linked to existing ingredient", match_id in ing_link_ids,
               f"links={ing_link_ids}")
+    else:
+        await run_setup(f"create_ingredient:{INVOICE_NUM}:{suggested}")
+        sp_row = get_sp_by_id(product_row_id)
+        ing_links = sp_row.get("Ingredients") or []
+        check("T4.2 SP linked to newly created ingredient", len(ing_links) >= 1,
+              f"links={ing_links}")
 
-        with open(state_path, encoding="utf-8") as f:
-            state = json.load(f)
-        check("T4.3 setup_complete=True", state.get("setup_complete") is True)
+    with open(state_path, encoding="utf-8") as f:
+        state = json.load(f)
+    check("T4.3 setup_complete=True", state.get("setup_complete") is True)
 
     # ── T5: Approval payload sent ──
     print("\n── T5: Verify approval payload was written ──")

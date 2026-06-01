@@ -52,14 +52,14 @@ def delete_setup_state(invoice_num: str) -> None:
         path.unlink()
 
 
-def _search_ingredients(base, query: str) -> List[Dict[str, Any]]:
-    """Fuzzy search Ingredients by Name, return top 3."""
+def _search_ingredients(base, query: str, limit: int = 50) -> List[Dict[str, Any]]:
+    """Fuzzy search Ingredients by Name, return top candidates for LLM context."""
     from rapidfuzz import fuzz
 
     candidates = []
     try:
         for row in base.list_rows("Ingredients"):
-            name = row.get("Name", "")
+            name = row.get("Ingredient Name", "")
             if name:
                 score = fuzz.token_set_ratio(query.lower(), name.lower())
                 candidates.append({"name": name, "row_id": row["_id"], "score": score})
@@ -67,11 +67,84 @@ def _search_ingredients(base, query: str) -> List[Dict[str, Any]]:
         print(f"[ERROR] Ingredient search failed: {e}")
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
-    return candidates[:3]
+    return candidates[:limit]
 
 
-async def _send_product_prompt(query, state: Dict[str, Any], invoice_num: str, prefix_text: str) -> None:
-    """Edit message to: Create product 'X'? [Add Product] [Skip]"""
+def _llm_match_ingredient(sp_name: str, candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Single Gemini call: match SP name to ingredient or suggest a canonical name.
+    Returns {"match_row_id": str|None, "match_name": str|None, "suggested_name": str}
+    """
+    import os, json
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+    candidate_lines = "\n".join(
+        f"  id={c['row_id']} | {c['name']}" for c in candidates
+    ) if candidates else "  (none)"
+
+    prompt = (
+        f"Malaysian cafe ingredient classifier.\n\n"
+        f"Supplier product: {sp_name}\n\n"
+        f"Ingredient table candidates:\n{candidate_lines}\n\n"
+        f"Match this supplier product to the correct ingredient if one fits well, "
+        f"else return null for match fields. "
+        f"Always return a short canonical ingredient name (e.g. 'Smoked Salmon', not the full supplier product name).\n\n"
+        f"Return ONLY valid JSON:\n"
+        f'{{"match_row_id": "string or null", "match_name": "string or null", "suggested_name": "string"}}'
+    )
+
+    import time
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=[prompt],
+                config=types.GenerateContentConfig(response_mime_type="application/json"),
+            )
+            result = json.loads(response.text.strip())
+            if "suggested_name" not in result or not result["suggested_name"]:
+                result["suggested_name"] = sp_name
+            return result
+        except Exception as e:
+            print(f"[ERROR] LLM ingredient match failed (attempt {attempt + 1}/3): {e}")
+            if attempt < 2:
+                time.sleep(10)
+    return {"match_row_id": None, "match_name": None, "suggested_name": sp_name}
+
+
+def _search_sps_by_name(base, query: str) -> List[Dict[str, Any]]:
+    """Fuzzy search Supplier Products by name, return top 2 matches at >=80 score."""
+    from rapidfuzz import fuzz
+
+    candidates = []
+    start, page = 0, 1000
+    try:
+        while True:
+            batch = base.list_rows("Supplier Products", start=start, limit=page)
+            if not batch:
+                break
+            for row in batch:
+                name = row.get("Supplier Product Name") or ""
+                if name:
+                    score = fuzz.token_set_ratio(query.lower(), name.lower())
+                    if score >= 80:
+                        candidates.append({"name": name, "row_id": row["_id"], "score": score})
+            if len(batch) < page:
+                break
+            start += page
+    except Exception as e:
+        print(f"[ERROR] SP search failed: {e}")
+
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    return candidates[:2]
+
+
+async def _send_product_prompt(query, state: Dict[str, Any], invoice_num: str, prefix_text: str,
+                                base=None) -> None:
+    """Edit message to: Create product 'X'? [Link Existing?] [Add Product] [Skip]"""
     item = state["items"][state["current_item_idx"]]
     product_name = item["product_name"]
 
@@ -82,10 +155,20 @@ async def _send_product_prompt(query, state: Dict[str, Any], invoice_num: str, p
         f"Create this product?"
     )
 
-    keyboard = [[
+    keyboard = []
+
+    if base:
+        existing = _search_sps_by_name(base, product_name)
+        for sp in existing:
+            label = f"Link: {sp['name'][:35]} ({sp['score']}%)"
+            keyboard.append([InlineKeyboardButton(
+                label, callback_data=f"link_existing_product:{invoice_num}:{sp['row_id']}"
+            )])
+
+    keyboard.append([
         InlineKeyboardButton("Add Product", callback_data=f"add_product:{invoice_num}"),
         InlineKeyboardButton("Skip", callback_data=f"skip_product:{invoice_num}"),
-    ]]
+    ])
 
     try:
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -93,18 +176,23 @@ async def _send_product_prompt(query, state: Dict[str, Any], invoice_num: str, p
         print(f"[ERROR] Failed to edit message: {e}")
 
 
-async def _send_ingredient_prompt(query, state: Dict[str, Any], invoice_num: str,
-                                  product_name: str, candidates: List[Dict], prefix_text: str) -> None:
-    """Edit message with up to 3 ingredient buttons + [Skip]."""
-    keyboard = []
-    for cand in candidates:
-        score = cand.get("score", 0)
-        btn = InlineKeyboardButton(
-            f"{cand['name']} ({score}%)",
-            callback_data=f"link_ingredient:{invoice_num}:{cand['row_id']}"
-        )
-        keyboard.append([btn])
+async def _send_ingredient_prompt_llm(query, state: Dict[str, Any], invoice_num: str,
+                                       product_name: str, llm_result: Dict, prefix_text: str) -> None:
+    """Edit message with LLM-determined ingredient button(s) + [Skip]."""
+    match_row_id = llm_result.get("match_row_id")
+    match_name = llm_result.get("match_name")
+    suggested_name = llm_result.get("suggested_name") or product_name
 
+    keyboard = []
+    if match_row_id and match_name:
+        keyboard.append([InlineKeyboardButton(
+            f"Link: {match_name}",
+            callback_data=f"link_ingredient:{invoice_num}:{match_row_id}"
+        )])
+    keyboard.append([InlineKeyboardButton(
+        f"Create: {suggested_name[:40]}",
+        callback_data=f"create_ingredient:{invoice_num}:{suggested_name}"
+    )])
     keyboard.append([InlineKeyboardButton("Skip", callback_data=f"skip_ingredient:{invoice_num}")])
 
     text = (
@@ -160,7 +248,7 @@ async def _advance_to_next_item_or_finish(query, state: Dict[str, Any], invoice_
 
     if state["current_item_idx"] < len(state["items"]):
         save_setup_state(invoice_num, state)
-        await _send_product_prompt(query, state, invoice_num, new_text)
+        await _send_product_prompt(query, state, invoice_num, new_text, base=base)
     else:
         from approval_handler import load_pending
         from notifier import notify_invoice_comparison
@@ -216,7 +304,7 @@ async def handle_setup_callback(update: Update, context: ContextTypes.DEFAULT_TY
         if state.get("supplier_added") and state.get("supplier_row_id"):
             new_text = f"[INFO] Supplier '{supplier_name}' already created."
             if state["items"]:
-                await _send_product_prompt(query, state, invoice_num, new_text)
+                await _send_product_prompt(query, state, invoice_num, new_text, base=base)
             return
         try:
             row_data = {"Supplier Name": supplier_name}
@@ -233,7 +321,7 @@ async def handle_setup_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
             new_text = f"[OK] Supplier '{supplier_name}' created."
             if state["items"]:
-                await _send_product_prompt(query, state, invoice_num, new_text)
+                await _send_product_prompt(query, state, invoice_num, new_text, base=base)
             else:
                 await _advance_to_next_item_or_finish(query, state, invoice_num, base, new_text)
         except Exception as e:
@@ -257,10 +345,8 @@ async def handle_setup_callback(update: Update, context: ContextTypes.DEFAULT_TY
         if item.get("product_added") and item.get("product_row_id"):
             new_text = f"[INFO] Product '{product_name}' already created."
             candidates = _search_ingredients(base, product_name)
-            if candidates:
-                await _send_ingredient_prompt(query, state, invoice_num, product_name, candidates, new_text)
-            else:
-                await _advance_to_next_item_or_finish(query, state, invoice_num, base, new_text)
+            llm_result = _llm_match_ingredient(product_name, candidates)
+            await _send_ingredient_prompt_llm(query, state, invoice_num, product_name, llm_result, new_text)
             return
 
         try:
@@ -291,13 +377,8 @@ async def handle_setup_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
             new_text = f"[OK] Product '{product_name}' created."
             candidates = _search_ingredients(base, product_name)
-
-            if candidates:
-                await _send_ingredient_prompt(query, state, invoice_num, product_name, candidates, new_text)
-            else:
-                item["ingredient_linked"] = False
-                save_setup_state(invoice_num, state)
-                await _advance_to_next_item_or_finish(query, state, invoice_num, base, new_text + " [No ingredients found, skipping.]")
+            llm_result = _llm_match_ingredient(product_name, candidates)
+            await _send_ingredient_prompt_llm(query, state, invoice_num, product_name, llm_result, new_text)
         except Exception as e:
             try:
                 await query.edit_message_text(f"[ERROR] Failed to create product: {e}")
@@ -341,6 +422,89 @@ async def handle_setup_callback(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception as e:
             try:
                 await query.edit_message_text(f"[ERROR] Failed to link ingredient: {e}")
+            except:
+                pass
+
+    elif action == "link_existing_product":
+        if not extra:
+            await query.answer("Invalid product", show_alert=True)
+            return
+
+        sp_row_id = extra
+        item = state["items"][state["current_item_idx"]]
+        supplier_row_id = state["supplier_row_id"]
+        product_name = item["product_name"]
+
+        try:
+            from seatable_writer import add_row_link
+            add_row_link(
+                base=base,
+                link_column_table="Supplier Products",
+                link_column_name="Supplier",
+                link_column_row_id=sp_row_id,
+                target_table="Suppliers",
+                target_row_id=supplier_row_id,
+            )
+
+            item["product_row_id"] = sp_row_id
+            item["product_added"] = True
+            save_setup_state(invoice_num, state)
+
+            from step2_compare import clear_caches
+            clear_caches()
+
+            new_text = f"[OK] Linked existing product '{product_name}'."
+            candidates = _search_ingredients(base, product_name)
+            llm_result = _llm_match_ingredient(product_name, candidates)
+            await _send_ingredient_prompt_llm(query, state, invoice_num, product_name, llm_result, new_text)
+        except Exception as e:
+            try:
+                await query.edit_message_text(f"[ERROR] Failed to link existing product: {e}")
+            except:
+                pass
+
+    elif action == "create_ingredient":
+        if not extra:
+            await query.answer("Invalid ingredient name", show_alert=True)
+            return
+
+        ingredient_name = extra
+        item = state["items"][state["current_item_idx"]]
+        product_row_id = item.get("product_row_id")
+
+        try:
+            import time as _time
+            new_ing = base.append_row("Ingredients", {"Ingredient Name": ingredient_name})
+            if not new_ing or not isinstance(new_ing, dict) or not new_ing.get("_id"):
+                # Fallback: search for the inserted row
+                _time.sleep(1)
+                for row in base.list_rows("Ingredients"):
+                    if (row.get("Ingredient Name") or "").strip() == ingredient_name.strip():
+                        new_ing = row
+                        break
+            if not new_ing or not new_ing.get("_id"):
+                raise ValueError(f"Could not create or locate Ingredient '{ingredient_name}'")
+            ingredient_row_id = new_ing["_id"]
+
+            from seatable_writer import add_row_link
+            add_row_link(
+                base=base,
+                link_column_table="Supplier Products",
+                link_column_name="Ingredients",
+                link_column_row_id=product_row_id,
+                target_table="Ingredients",
+                target_row_id=ingredient_row_id,
+            )
+
+            item["ingredient_row_id"] = ingredient_row_id
+            item["ingredient_linked"] = True
+            save_setup_state(invoice_num, state)
+
+            new_text = f"[OK] Ingredient '{ingredient_name}' created and linked."
+            await _advance_to_next_item_or_finish(query, state, invoice_num, base, new_text)
+        except Exception as e:
+            try:
+                await query.edit_message_text(f"[ERROR] Failed to create ingredient: {e}")
             except:
                 pass
 
