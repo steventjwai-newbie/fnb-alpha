@@ -115,8 +115,10 @@ def _llm_match_ingredient(sp_name: str, candidates: List[Dict[str, Any]]) -> Dic
     return {"match_row_id": None, "match_name": None, "suggested_name": sp_name}
 
 
-def _search_sps_by_name(base, query: str) -> List[Dict[str, Any]]:
-    """Fuzzy search Supplier Products by name, return top 2 matches at >=80 score."""
+def _search_sps_by_name(base, query: str, supplier_row_id: str = None) -> List[Dict[str, Any]]:
+    """Fuzzy search Supplier Products by name at >=80 score.
+    When supplier_row_id is given, only considers SPs linked to that supplier.
+    """
     from rapidfuzz import fuzz
 
     candidates = []
@@ -127,6 +129,11 @@ def _search_sps_by_name(base, query: str) -> List[Dict[str, Any]]:
             if not batch:
                 break
             for row in batch:
+                if supplier_row_id:
+                    links = row.get("Supplier") or []
+                    link_ids = [l.get("row_id") if isinstance(l, dict) else l for l in links]
+                    if supplier_row_id not in link_ids:
+                        continue
                 name = row.get("Supplier Product Name") or ""
                 if name:
                     score = fuzz.token_set_ratio(query.lower(), name.lower())
@@ -158,7 +165,8 @@ async def _send_product_prompt(query, state: Dict[str, Any], invoice_num: str, p
     keyboard = []
 
     if base:
-        existing = _search_sps_by_name(base, product_name)
+        supplier_row_id = state.get("supplier_row_id")
+        existing = _search_sps_by_name(base, product_name, supplier_row_id=supplier_row_id)
         for sp in existing:
             label = f"Link: {sp['name'][:35]} ({sp['score']}%)"
             keyboard.append([InlineKeyboardButton(
@@ -189,9 +197,10 @@ async def _send_ingredient_prompt_llm(query, state: Dict[str, Any], invoice_num:
             f"Link: {match_name}",
             callback_data=f"link_ingredient:{invoice_num}:{match_row_id}"
         )])
+    cb_name = suggested_name[:40]  # Telegram callback_data hard limit is 64 bytes
     keyboard.append([InlineKeyboardButton(
-        f"Create: {suggested_name[:40]}",
-        callback_data=f"create_ingredient:{invoice_num}:{suggested_name}"
+        f"Create: {cb_name}",
+        callback_data=f"create_ingredient:{invoice_num}:{cb_name}"
     )])
     keyboard.append([InlineKeyboardButton("Skip", callback_data=f"skip_ingredient:{invoice_num}")])
 

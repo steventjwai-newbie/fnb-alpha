@@ -308,6 +308,29 @@ async def main():
         state = json.load(f)
     check("T4.3 setup_complete=True", state.get("setup_complete") is True)
 
+    # ── T4.4-T4.5: Verify create_ingredient mechanics directly ──
+    print("\n── T4.4: Verify create_ingredient mechanics (append_row + link) ──")
+    base2 = get_base()
+    test_ing_name = "_E2E_TestIng_"
+    new_ing = base2.append_row("Ingredients", {"Ingredient Name": test_ing_name})
+    check("T4.4 append_row Ingredients returns row with _id",
+          bool(new_ing and isinstance(new_ing, dict) and new_ing.get("_id")),
+          f"result={repr(new_ing) if new_ing else 'None'}")
+
+    if new_ing and new_ing.get("_id"):
+        from seatable_writer import add_row_link
+        ok = add_row_link(
+            base=base2,
+            link_column_table="Supplier Products",
+            link_column_name="Ingredients",
+            link_column_row_id=product_row_id,
+            target_table="Ingredients",
+            target_row_id=new_ing["_id"],
+        )
+        check("T4.5 SP→Ingredient link created", ok)
+        base2.delete_row("Ingredients", new_ing["_id"])
+        print(f"  [CLEAN] deleted test ingredient {new_ing['_id']}")
+
     # ── T5: Approval payload sent ──
     print("\n── T5: Verify approval payload was written ──")
     # After setup completes, the pending file should have been overwritten with
