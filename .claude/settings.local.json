@@ -28,7 +28,11 @@
       "Bash(disown)",
       "Bash(echo \"intake_listener PID: $!\")",
       "Bash(echo \"approval_handler PID: $!\")",
-      "Bash(git *)"
+      "Bash(git *)",
+      "WebFetch(domain:api.github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "PowerShell(ls C:\\\\Users\\\\Admin\\\\projects\\\\zeta-engine\\\\ -Recurse -File | Where-Object { $_.FullName -notmatch '\\\\.venv|__pycache__|\\\\.git' } | Select-Object -ExpandProperty FullName | ForEach-Object { $_.Replace\\('C:\\\\Users\\\\Admin\\\\projects\\\\zeta-engine\\\\', ''\\) } | Sort-Object)",
+      "PowerShell(Get-WmiObject *)"
     ]
   }
 }
