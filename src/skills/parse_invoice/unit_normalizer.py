@@ -98,6 +98,42 @@ def to_base_qty(unit_quantity, uom: str) -> Optional[float]:
         return None
 
 
+def to_seatable_base(unit_quantity, uom: str) -> Optional[tuple]:
+    """
+    Convert unit_quantity + uom into the values to store in Seatable.
+
+    Follows the existing convention: Unit Quantity is always stored in the
+    smallest base unit (grams for mass, ml for volume), never in KG/L/LB etc.
+    Container units (PCS, BTL, sachets, etc.) are returned unchanged.
+
+    Returns (seatable_unit_qty: float, seatable_uom: str) or None if inputs missing.
+
+    Examples:
+        (1,    'kg')     → (1000.0, 'G')
+        (1.5,  'L')      → (1500.0, 'ML')
+        (500,  'G')      → (500.0,  'G')
+        (1,    'lb')     → (453.592,'G')
+        (100,  'sachets')→ (100,    'SACHETS')   # container, no conversion
+        (1,    'PCS')    → (1,      'PCS')        # container, no conversion
+    """
+    if unit_quantity is None or not uom:
+        return None
+    clean = _clean_uom(uom)
+    entry = STANDARD.get(clean)
+    if entry:
+        # Measurement unit — convert to base
+        base_unit_name, factor = entry
+        try:
+            base_qty = float(Decimal(str(unit_quantity)) * factor)
+        except (ValueError, TypeError, ArithmeticError):
+            return None
+        seatable_uom = "G" if base_unit_name == "gram" else "ML"
+        return base_qty, seatable_uom
+    else:
+        # Container unit — store as-is, uppercase
+        return unit_quantity, uom.upper()
+
+
 def get_base_unit_info(invoice_unit: str) -> Optional[tuple[Decimal, str]]:
     """Returns (factor_to_base, base_unit) or None if unit unknown."""
     _, clean_unit = _parse_unit(invoice_unit)

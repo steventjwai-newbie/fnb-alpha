@@ -205,13 +205,16 @@ async def _send_product_prompt(query, state: Dict[str, Any], invoice_num: str, p
         item["llm_classification"] = llm_result
         save_setup_state(invoice_num, state)
 
-    # Build pack preview lines
+    # Build pack preview lines (show what will be stored in Seatable)
     pack_lines = []
     if llm_result:
         if llm_result.get("pack_size"):
             pack_lines.append(f"  Pack: {llm_result['pack_size']}")
         if llm_result.get("unit_quantity") is not None and llm_result.get("unit_of_measure"):
-            pack_lines.append(f"  Unit: {llm_result['unit_quantity']} {llm_result['unit_of_measure']}")
+            from unit_normalizer import to_seatable_base
+            converted = to_seatable_base(llm_result["unit_quantity"], llm_result["unit_of_measure"])
+            if converted:
+                pack_lines.append(f"  Unit: {converted[0]} {converted[1]}")
 
     pack_str = ("\n" + "\n".join(pack_lines)) if pack_lines else ""
     text = (
@@ -432,15 +435,12 @@ async def handle_setup_callback(update: Update, context: ContextTypes.DEFAULT_TY
             }
             if llm_result.get("pack_size"):
                 row_data["Pack Size"] = llm_result["pack_size"]
-            if llm_result.get("unit_quantity") is not None:
-                row_data["Unit Quantity"] = llm_result["unit_quantity"]
-            if llm_result.get("unit_of_measure"):
-                uom = llm_result["unit_of_measure"]
-                row_data["Unit of Measure"] = uom.upper()
-                from unit_normalizer import to_base_qty
-                base_qty = to_base_qty(llm_result["unit_quantity"], uom)
-                if base_qty is not None:
-                    row_data["Base Qty"] = base_qty
+            if llm_result.get("unit_quantity") is not None and llm_result.get("unit_of_measure"):
+                from unit_normalizer import to_seatable_base
+                converted = to_seatable_base(llm_result["unit_quantity"], llm_result["unit_of_measure"])
+                if converted:
+                    row_data["Unit Quantity"] = converted[0]
+                    row_data["Unit of Measure"] = converted[1]
 
             row = base.append_row("Supplier Products", row_data)
             product_row_id = row["_id"]
@@ -466,7 +466,10 @@ async def handle_setup_callback(update: Update, context: ContextTypes.DEFAULT_TY
             if llm_result.get("pack_size"):
                 pack_parts.append(f"Pack: {llm_result['pack_size']}")
             if llm_result.get("unit_quantity") is not None and llm_result.get("unit_of_measure"):
-                pack_parts.append(f"Unit: {llm_result['unit_quantity']} {llm_result['unit_of_measure']}")
+                from unit_normalizer import to_seatable_base
+                converted = to_seatable_base(llm_result["unit_quantity"], llm_result["unit_of_measure"])
+                if converted:
+                    pack_parts.append(f"Unit: {converted[0]} {converted[1]}")
             pack_suffix = f" ({', '.join(pack_parts)})" if pack_parts else ""
             new_text = f"[OK] Product '{product_name}' created.{pack_suffix}"
 
