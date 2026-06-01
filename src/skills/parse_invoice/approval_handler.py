@@ -165,6 +165,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update_payload["Unit Quantity"] = bp["unit_quantity"]
         if bp.get("unit_of_measure"):
             update_payload["Unit of Measure"] = bp["unit_of_measure"].upper()
+        if bp.get("base_qty") is not None:
+            update_payload["Base Qty"] = bp["base_qty"]
 
         try:
             from seatable_writer import _base as _sw_base

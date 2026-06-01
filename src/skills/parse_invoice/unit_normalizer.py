@@ -77,6 +77,27 @@ def _parse_unit(raw: str) -> tuple[Decimal, str]:
     return Decimal("1"), cleaned
 
 
+def to_base_qty(unit_quantity, uom: str) -> Optional[float]:
+    """
+    Convert unit_quantity × uom → equivalent quantity in the smallest base unit.
+    Returns grams for mass units, ml for volume units. Returns None for
+    container/unknown units (PCS, BTL, TUB, etc.) or missing inputs.
+
+    Examples: (1, 'KG') → 1000.0   (500, 'G') → 500.0   (1.5, 'L') → 1500.0
+    """
+    if unit_quantity is None or not uom:
+        return None
+    clean = _clean_uom(uom)
+    entry = STANDARD.get(clean)
+    if not entry:
+        return None
+    _, factor = entry
+    try:
+        return float(Decimal(str(unit_quantity)) * factor)
+    except (ValueError, TypeError, ArithmeticError):
+        return None
+
+
 def get_base_unit_info(invoice_unit: str) -> Optional[tuple[Decimal, str]]:
     """Returns (factor_to_base, base_unit) or None if unit unknown."""
     _, clean_unit = _parse_unit(invoice_unit)
