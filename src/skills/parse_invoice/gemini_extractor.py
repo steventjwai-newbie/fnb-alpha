@@ -100,7 +100,9 @@ SYSTEM_PROMPT = (
     "Tick marks and checkmarks (✓ ✔) alone are NOT meaningful — set has_handwriting: false.\n"
     "- handwriting_content: transcribe meaningful handwritten annotations verbatim. "
     "Exclude signatures, company names, registration numbers, rubber stamps, and tick/checkmarks.\n"
-    "- crossed_out: set true on any line item that has been crossed out or marked with X by hand.\n"
+    "- crossed_out: set true ONLY if the item description or price is physically struck through with a line. "
+    "A tick, slash, or checkmark through the row NUMBER (e.g. ✓1, /2) is a delivery confirmation — do NOT set crossed_out. "
+    "Only the item text or price itself being struck through counts.\n"
     "- Return ONLY the JSON object."
 )
 

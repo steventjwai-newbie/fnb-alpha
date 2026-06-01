@@ -109,7 +109,10 @@ def build_inline_keyboard(payload: Dict[str, Any]) -> Optional[InlineKeyboardMar
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()  # acknowledge tap
+    try:
+        await query.answer()
+    except Exception:
+        pass  # query expired (>30s); continue processing anyway
 
     user = query.from_user
     user_ref = f"{user.username or user.first_name}({user.id})"

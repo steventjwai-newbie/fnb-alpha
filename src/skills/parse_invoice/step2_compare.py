@@ -332,15 +332,25 @@ def build_comparison(step1_result: Dict[str, Any]) -> List[Dict[str, Any]]:
                 )
 
             if new_price_per_pack is None:
-                unit_mismatches.append({
-                    "product_name": product_name,
-                    "seatable_product": best_name,
-                    "sp_code": sp_code,
-                    "sp_row_id": sp_row_id,
-                    "match_score": round(match_score, 1),
-                    "invoice_unit": invoice_unit,
-                    "supplier_uom": supplier_uom,
-                })
+                if match_score < CONFIRM:
+                    # Low-confidence match + unit mismatch = almost certainly wrong SP.
+                    # Route to unmatched so the setup flow offers "create new product".
+                    unmatched_items.append({
+                        "product_name": product_name,
+                        "invoice_unit": invoice_unit,
+                        "invoice_unit_price": float(invoice_unit_price) if invoice_unit_price is not None else None,
+                        "candidates": _make_candidates(results),
+                    })
+                else:
+                    unit_mismatches.append({
+                        "product_name": product_name,
+                        "seatable_product": best_name,
+                        "sp_code": sp_code,
+                        "sp_row_id": sp_row_id,
+                        "match_score": round(match_score, 1),
+                        "invoice_unit": invoice_unit,
+                        "supplier_uom": supplier_uom,
+                    })
                 continue
 
             new_price = float(new_price_per_pack)
