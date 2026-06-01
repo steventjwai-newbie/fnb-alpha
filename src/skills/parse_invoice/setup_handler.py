@@ -435,7 +435,7 @@ async def handle_setup_callback(update: Update, context: ContextTypes.DEFAULT_TY
             if llm_result.get("unit_quantity") is not None:
                 row_data["Unit Quantity"] = llm_result["unit_quantity"]
             if llm_result.get("unit_of_measure"):
-                row_data["Unit of Measure"] = llm_result["unit_of_measure"]
+                row_data["Unit of Measure"] = llm_result["unit_of_measure"].upper()
 
             row = base.append_row("Supplier Products", row_data)
             product_row_id = row["_id"]

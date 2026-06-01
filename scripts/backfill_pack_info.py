@@ -214,13 +214,14 @@ def main():
 
         # Save proposed values so approval_handler can apply them
         pending_path = BACKFILL_DIR / f"{sp_row_id}.json"
+        uom = result.get("unit_of_measure")
         with open(pending_path, "w", encoding="utf-8") as f:
             json.dump({
                 "sp_row_id": sp_row_id,
                 "sp_name": sp_name,
                 "pack_size": result.get("pack_size"),
                 "unit_quantity": result.get("unit_quantity"),
-                "unit_of_measure": result.get("unit_of_measure"),
+                "unit_of_measure": uom.upper() if uom else None,
                 "whole_piece": result.get("whole_piece", False),
             }, f, ensure_ascii=False, indent=2)
 
