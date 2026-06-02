@@ -131,6 +131,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "add_product", "skip_product",
         "link_ingredient", "skip_ingredient",
         "link_existing_product", "create_ingredient",
+        "add_and_link",
     }
     if action in SETUP_ACTIONS:
         from setup_handler import handle_setup_callback

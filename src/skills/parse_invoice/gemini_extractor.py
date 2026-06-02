@@ -78,7 +78,9 @@ SYSTEM_PROMPT = (
     '          "unit": "kg/pcs/btl/ctn/etc or null",\n'
     '          "unit_price": number or null,\n'
     '          "total_price": number or null,\n'
-    '          "crossed_out": true or false\n'
+    '          "crossed_out": true or false,\n'
+    '          "is_promotional": true or false,\n'
+    '          "promotion_note": "verbatim discount text or null"\n'
     '        }\n'
     '      ]\n'
     '    }\n'
@@ -103,6 +105,18 @@ SYSTEM_PROMPT = (
     "- crossed_out: set true ONLY if the item description or price is physically struck through with a line. "
     "A tick, slash, or checkmark through the row NUMBER (e.g. ✓1, /2) is a delivery confirmation — do NOT set crossed_out. "
     "Only the item text or price itself being struck through counts.\n"
+    "- Retail receipt single-line items: when a description line ends with a count token followed by a "
+    "container word (e.g. 'CAMERON STRAWBERRY 2 PKT', 'ORANGE JUICE 3 BTL'), treat the trailing "
+    "'<n> <unit>' as quantity and unit. Set product_name to the description without the count token. "
+    "Example: 'CAMERON STRAWBERRY 2 PKT' → product_name='CAMERON STRAWBERRY', quantity=2, unit='PKT'. "
+    "When only total_price is shown (no separate unit_price column), set unit_price = total_price / quantity.\n"
+    "- Multi-pack bundle vs purchase quantity: if the count token describes the product's own bundle format "
+    "(e.g. 'MILK 6X200ML' = a six-pack carton), keep the bundle description in product_name and set "
+    "quantity to the actual number of units purchased (default 1 if no separate quantity column shown).\n"
+    "- is_promotional / promotion_note: set is_promotional=true when the line shows discount language "
+    "('Promo', 'Disc', '% off', 'Off', 'Buy N Free M', 'N for RM X', 'Free', 'FOC') OR when the "
+    "receipt has a separate discount/rebate line for this item. Set promotion_note to the verbatim "
+    "discount text. Keep total_price as the actual amount paid (after discount).\n"
     "- Return ONLY the JSON object."
 )
 
@@ -263,6 +277,8 @@ def _parse_line_items(raw_items: list) -> List[Dict[str, Any]]:
         unit_price = _to_decimal(item.get("unit_price"))
         total_price = _to_decimal(item.get("total_price"))
         crossed_out = bool(item.get("crossed_out", False))
+        is_promotional = bool(item.get("is_promotional", False))
+        promotion_note = item.get("promotion_note") or None
 
         if not product_name:
             item_flags.append("missing_product_name")
@@ -274,6 +290,8 @@ def _parse_line_items(raw_items: list) -> List[Dict[str, Any]]:
             item_flags.append("missing_total_price")
         if crossed_out:
             item_flags.append("crossed_out")
+        if is_promotional:
+            item_flags.append("promotional")
 
         line_items.append(
             {
@@ -283,6 +301,8 @@ def _parse_line_items(raw_items: list) -> List[Dict[str, Any]]:
                 "unit_price": unit_price,
                 "total_price": total_price,
                 "crossed_out": crossed_out,
+                "is_promotional": is_promotional,
+                "promotion_note": promotion_note,
                 "confidence": None,
                 "flags": item_flags,
             }

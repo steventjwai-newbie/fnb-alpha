@@ -189,7 +189,7 @@ def _search_sps_by_name(base, query: str, supplier_row_id: str = None) -> List[D
 
 async def _send_product_prompt(query, state: Dict[str, Any], invoice_num: str, prefix_text: str,
                                 base=None) -> None:
-    """Edit message to: Create product 'X'? [pack info] [Link Existing?] [Add Product] [Skip]"""
+    """Edit message to: Create product 'X'? [ingredient suggestion] [Add Product] [Skip]"""
     item = state["items"][state["current_item_idx"]]
     product_name = item["product_name"]
 
@@ -217,25 +217,37 @@ async def _send_product_prompt(query, state: Dict[str, Any], invoice_num: str, p
                 pack_lines.append(f"  Unit: {converted[0]} {converted[1]}")
 
     pack_str = ("\n" + "\n".join(pack_lines)) if pack_lines else ""
+    ing_match_name = (llm_result or {}).get("match_name")
+    ing_suggestion = f"\n→ Ingredient match: {ing_match_name}" if ing_match_name else ""
     text = (
         f"{prefix_text}\n"
         f"Item {state['current_item_idx'] + 1}/{len(state['items'])}: {product_name}\n"
-        f"Supplier: {state['supplier_name']}{pack_str}\n"
+        f"Supplier: {state['supplier_name']}{pack_str}{ing_suggestion}\n"
         f"Create this product?"
     )
 
     keyboard = []
+    # One-click: create SP + link to LLM-suggested ingredient
+    if llm_result and llm_result.get("match_row_id") and llm_result.get("match_name"):
+        match_row_id = llm_result["match_row_id"]
+        match_name = llm_result["match_name"]
+        keyboard.append([InlineKeyboardButton(
+            f"✓ Create + Link: {match_name[:32]}",
+            callback_data=f"add_and_link:{invoice_num}:{match_row_id}"
+        )])
+
+    # Existing SP same supplier (>=80 score)
     if base:
         supplier_row_id = state.get("supplier_row_id")
         existing = _search_sps_by_name(base, product_name, supplier_row_id=supplier_row_id)
         for sp in existing:
-            label = f"Link: {sp['name'][:35]} ({sp['score']}%)"
+            label = f"Link SP: {sp['name'][:30]} ({sp['score']}%)"
             keyboard.append([InlineKeyboardButton(
                 label, callback_data=f"link_existing_product:{invoice_num}:{sp['row_id']}"
             )])
 
     keyboard.append([
-        InlineKeyboardButton("Add Product", callback_data=f"add_product:{invoice_num}"),
+        InlineKeyboardButton("New ingredient", callback_data=f"add_product:{invoice_num}"),
         InlineKeyboardButton("Skip", callback_data=f"skip_product:{invoice_num}"),
     ])
 
@@ -348,7 +360,10 @@ async def _advance_to_next_item_or_finish(query, state: Dict[str, Any], invoice_
 async def handle_setup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Main handler for setup callbacks."""
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception:
+        pass
 
     user = query.from_user
     user_ref = f"{user.username or user.first_name}({user.id})"
@@ -487,6 +502,58 @@ async def handle_setup_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
         new_text = f"[SKIP] Product '{item['product_name']}' skipped."
         await _advance_to_next_item_or_finish(query, state, invoice_num, base, new_text)
+
+    elif action == "add_and_link":
+        # extra = ingredient_row_id; create SP + link ingredient in one step
+        ingredient_row_id = extra
+        if not ingredient_row_id:
+            await query.answer("Missing ingredient ID", show_alert=True)
+            return
+
+        item = state["items"][state["current_item_idx"]]
+        product_name = item["product_name"]
+        supplier_row_id = state["supplier_row_id"]
+        llm_result = item.get("llm_classification") or {}
+
+        try:
+            row_data = {
+                "Supplier Product Name": product_name,
+                "Supplier": [supplier_row_id],
+                "Active Status": "Active",
+            }
+            if llm_result.get("pack_size"):
+                row_data["Pack Size"] = llm_result["pack_size"]
+            if llm_result.get("unit_quantity") is not None and llm_result.get("unit_of_measure"):
+                from unit_normalizer import to_seatable_base
+                converted = to_seatable_base(llm_result["unit_quantity"], llm_result["unit_of_measure"])
+                if converted:
+                    row_data["Unit Quantity"] = converted[0]
+                    row_data["Unit of Measure"] = converted[1]
+
+            row = base.append_row("Supplier Products", row_data)
+            product_row_id = row["_id"]
+
+            from seatable_writer import add_row_link
+            add_row_link(base, "Supplier Products", "Supplier", product_row_id, "Suppliers", supplier_row_id)
+            add_row_link(base, "Supplier Products", "Ingredients", product_row_id, "Ingredients", ingredient_row_id)
+
+            item["product_row_id"] = product_row_id
+            item["product_added"] = True
+            item["ingredient_row_id"] = ingredient_row_id
+            item["ingredient_linked"] = True
+            save_setup_state(invoice_num, state)
+
+            from step2_compare import clear_caches
+            clear_caches()
+
+            ing_name = llm_result.get("match_name") or ingredient_row_id
+            new_text = f"[OK] SP '{product_name}' created + linked to '{ing_name}'."
+            await _advance_to_next_item_or_finish(query, state, invoice_num, base, new_text)
+        except Exception as e:
+            try:
+                await query.edit_message_text(f"[ERROR] Failed to create SP: {e}")
+            except Exception:
+                pass
 
     elif action == "link_ingredient":
         if not extra:

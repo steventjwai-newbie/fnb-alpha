@@ -370,6 +370,12 @@ def build_comparison(step1_result: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "diff_pct": round(diff_pct, 1),
             }
 
+            if item.get("is_promotional"):
+                item_payload["promotion_note"] = item.get("promotion_note")
+                item_payload["candidates"] = _make_candidates(results)
+                confirm_items.append(item_payload)
+                continue
+
             if not price_changed:
                 matched_items.append({
                     "product_name": product_name,
@@ -388,7 +394,16 @@ def build_comparison(step1_result: Dict[str, Any]) -> List[Dict[str, Any]]:
                 item_payload["candidates"] = _make_candidates(results)
                 if diff_pct > PRICE_CHANGE_SANITY_CAP_PCT:
                     item_payload["magnitude_flag"] = True
-                confirm_items.append(item_payload)
+                # Low-confidence match + large price change = wrong SP, route to setup flow
+                if match_score < CONFIRM and diff_pct > PRICE_CHANGE_SANITY_CAP_PCT:
+                    unmatched_items.append({
+                        "product_name": product_name,
+                        "invoice_unit": invoice_unit,
+                        "invoice_unit_price": float(invoice_unit_price) if invoice_unit_price is not None else None,
+                        "candidates": _make_candidates(results),
+                    })
+                else:
+                    confirm_items.append(item_payload)
             else:
                 price_changes.append(item_payload)
 
@@ -439,6 +454,8 @@ def format_telegram_message(payload: Dict[str, Any]) -> str:
                 flags.append("📦 container=pack assumed")
             if c.get("magnitude_flag"):
                 flags.append("⚠️ large change")
+            if c.get("promotion_note"):
+                flags.append(f"🏷️ {c['promotion_note']}")
             flag_str = " " + " ".join(flags) if flags else ""
             lines.append(f"  {item_idx}. {c['product_name']} → {c['seatable_product']} ({c['match_score']}%){flag_str}")
             lines.append(f"     RM{c['old_price']:.2f} → RM{c['new_price']:.2f}/{c['unit']} ({c['diff_pct']}%)")
