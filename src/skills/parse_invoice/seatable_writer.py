@@ -291,27 +291,31 @@ def commit_price_change(
     invoice_payload: Dict[str, Any],
     flagged_by: str,
     invoice_file_path: Optional[str] = None,
+    base: Optional[Base] = None,
+    invoice_row_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Atomic-ish write: ensures Invoices row exists, optionally attaches file,
     writes Price History, then updates Supplier Product. Returns dict with status + details.
 
-    Note: not transactional. If SP update fails after Price History write,
-    you'll have an orphan history row. Acceptable for v1.
+    Pass pre-built `base` and `invoice_row_id` when approving multiple items in one
+    callback to avoid redundant auth and Invoices lookups.
     """
-    base = _base()
+    if base is None:
+        base = _base()
 
-    invoice_row_id = upsert_invoice_row(
-        base=base,
-        invoice_number=invoice_payload["invoice_number"],
-        supplier_name=invoice_payload["supplier_name"],
-        supplier_row_id=invoice_payload.get("supplier_row_id", ""),
-        invoice_date=invoice_payload.get("invoice_date", ""),
-    )
+    if invoice_row_id is None:
+        invoice_row_id = upsert_invoice_row(
+            base=base,
+            invoice_number=invoice_payload["invoice_number"],
+            supplier_name=invoice_payload["supplier_name"],
+            supplier_row_id=invoice_payload.get("supplier_row_id", ""),
+            invoice_date=invoice_payload.get("invoice_date", ""),
+        )
     if not invoice_row_id:
         return {"status": "error", "step": "invoices", "message": "Could not upsert invoice row"}
 
-    # Optionally attach invoice file
+    # Attach file only when caller hasn't already done so (invoice_file_path=None on reuse)
     if invoice_file_path:
         attach_invoice_file(base, invoice_row_id, invoice_file_path)
 

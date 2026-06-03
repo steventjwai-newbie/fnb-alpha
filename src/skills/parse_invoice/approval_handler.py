@@ -21,7 +21,7 @@ from typing import Dict, Any, List, Optional
 
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 load_dotenv()
 
@@ -206,6 +206,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         targets = [target]
 
+    # For yes actions: auth once + upsert invoice row once, reuse across all items
+    _shared_base = None
+    _shared_invoice_row_id = None
+    if action == "yes":
+        from seatable_writer import _base as _sw_base, upsert_invoice_row, attach_invoice_file
+        try:
+            _shared_base = _sw_base()
+            _shared_invoice_row_id = upsert_invoice_row(
+                _shared_base,
+                invoice_num,
+                payload.get("supplier_name", ""),
+                payload.get("supplier_row_id", ""),
+                payload.get("invoice_date", ""),
+            )
+            if _shared_invoice_row_id and payload.get("invoice_file_path"):
+                attach_invoice_file(_shared_base, _shared_invoice_row_id, payload["invoice_file_path"])
+        except Exception as e:
+            print(f"[WARNING] Pre-auth failed, will retry per-item: {e}")
+            _shared_base = None
+            _shared_invoice_row_id = None
+
     # Process each target
     results = []
     for idx_str in targets:
@@ -223,7 +244,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if action == "yes":
             from seatable_writer import commit_price_change
 
-            # Auto-tier writes get "Auto:user"; confirm-tier get "Manual:user"
             flagged_by = (
                 f"Auto:{user_ref}" if item.get("_category") == "price_changes"
                 else f"Manual:{user_ref}"
@@ -233,7 +253,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 item,
                 payload,
                 flagged_by=flagged_by,
-                invoice_file_path=payload.get("invoice_file_path"),
+                base=_shared_base,
+                invoice_row_id=_shared_invoice_row_id,
             )
             if result["status"] == "ok":
                 statuses[idx_str] = "approved"
@@ -263,16 +284,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     all_done = all(v != "pending" for v in statuses.values())
     if all_done:
         try:
-            from seatable_writer import mark_invoice_processed, _base
-            base = _base()
-            # Look up invoice row by number
-            invoice_row_id = None
-            for row in base.list_rows("Invoices"):
-                if (row.get("Invoice Number") or "").strip() == invoice_num.strip():
-                    invoice_row_id = row.get("_id")
-                    break
-            if invoice_row_id:
-                mark_invoice_processed(base, invoice_row_id)
+            from seatable_writer import mark_invoice_processed, _base as _sw_base, upsert_invoice_row
+            b = _shared_base or _sw_base()
+            inv_id = _shared_invoice_row_id
+            if not inv_id:
+                inv_id = upsert_invoice_row(b, invoice_num, payload.get("supplier_name", ""),
+                                            payload.get("supplier_row_id", ""), payload.get("invoice_date", ""))
+            if inv_id:
+                mark_invoice_processed(b, inv_id)
                 new_text += "\n✅ Invoice marked Processed."
         except Exception as e:
             new_text += f"\n⚠️ Couldn't mark invoice Processed: {e}"
@@ -291,6 +310,84 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
+# /history command
+# ============================================================
+
+async def handle_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /history <product name>  — show price trend for a Supplier Product.
+    Uses base.query() (1 call per table) to stay within Seatable API limits.
+    """
+    term = " ".join(context.args).strip() if context.args else ""
+    if not term:
+        await update.message.reply_text("Usage: /history <product name or SP code>")
+        return
+
+    safe_term = term.replace("'", "''")  # basic SQL escape
+
+    from seatable_writer import _base as _sw_base
+    try:
+        base = _sw_base()
+    except Exception as e:
+        await update.message.reply_text(f"❌ Seatable auth failed: {e}")
+        return
+
+    # Find matching SP
+    try:
+        sp_rows = base.query(
+            f"SELECT `_id`, `Supplier Product Name`, `Price per Pack` "
+            f"FROM `Supplier Products` WHERE `Supplier Product Name` LIKE '%{safe_term}%' LIMIT 5"
+        )
+    except Exception:
+        sp_rows = []
+
+    if not sp_rows:
+        await update.message.reply_text(f"No product found matching '{term}'")
+        return
+
+    sp = sp_rows[0]
+    sp_name = sp.get("Supplier Product Name") or "?"
+    sp_id = sp.get("_id") or ""
+    current_price = sp.get("Price per Pack")
+
+    # Get recent price history
+    try:
+        history_rows = base.query(
+            "SELECT `_ctime`, `Old Price`, `New Price`, `Change %`, `Flagged By`, "
+            "`Supplier product (link)` FROM `Price History` ORDER BY `_ctime` DESC LIMIT 200"
+        )
+    except Exception:
+        history_rows = []
+
+    # Filter by SP row_id via link column
+    sp_history = []
+    for row in history_rows:
+        links = row.get("Supplier product (link)") or []
+        for link in links:
+            link_id = link.get("row_id") if isinstance(link, dict) else str(link)
+            if link_id == sp_id:
+                sp_history.append(row)
+                break
+
+    price_str = f"RM{float(current_price):.2f}" if current_price is not None else "not set"
+    lines = [f"📈 *{sp_name}*", f"Current: {price_str}\n"]
+
+    if not sp_history:
+        lines.append("_(no price history yet)_")
+    else:
+        for row in sp_history[:10]:
+            date_str = (row.get("_ctime") or "?")[:10]
+            old_p = row.get("Old Price") or 0
+            new_p = row.get("New Price") or 0
+            chg = row.get("Change %") or 0
+            by = (row.get("Flagged By") or "?").split(":")[0]  # "Auto" or "Manual"
+            arrow = "↑" if new_p > old_p else ("↓" if new_p < old_p else "→")
+            lines.append(f"`{date_str}` RM{old_p:.2f}→RM{new_p:.2f} {arrow}{abs(chg):.0f}% [{by}]")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -301,6 +398,7 @@ def main():
 
     app = Application.builder().token(SEATABLE_UPDATE_BOT_TOKEN).build()
     app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(CommandHandler("history", handle_history))
 
     print(f"[approval_handler] Listening on bot token ending …{SEATABLE_UPDATE_BOT_TOKEN[-6:]}")
     print(f"[approval_handler] Pending dir: {PENDING_DIR}")
