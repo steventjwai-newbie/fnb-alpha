@@ -206,9 +206,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         targets = [target]
 
-    # For yes actions: auth once + upsert invoice row once, reuse across all items
+    # For yes actions: auth once + upsert invoice row once, reuse across all items.
+    # _pending_file_path tracks whether file attachment still needs to happen:
+    # cleared once attached pre-loop (normal path) or after first commit (fallback path).
     _shared_base = None
     _shared_invoice_row_id = None
+    _pending_file_path = payload.get("invoice_file_path") if action == "yes" else None
     if action == "yes":
         from seatable_writer import _base as _sw_base, upsert_invoice_row, attach_invoice_file
         try:
@@ -220,8 +223,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 payload.get("supplier_row_id", ""),
                 payload.get("invoice_date", ""),
             )
-            if _shared_invoice_row_id and payload.get("invoice_file_path"):
-                attach_invoice_file(_shared_base, _shared_invoice_row_id, payload["invoice_file_path"])
+            if _shared_invoice_row_id and _pending_file_path:
+                attach_invoice_file(_shared_base, _shared_invoice_row_id, _pending_file_path)
+                _pending_file_path = None  # done; don't re-attach in commit calls
         except Exception as e:
             print(f"[WARNING] Pre-auth failed, will retry per-item: {e}")
             _shared_base = None
@@ -253,9 +257,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 item,
                 payload,
                 flagged_by=flagged_by,
+                invoice_file_path=_pending_file_path,
                 base=_shared_base,
                 invoice_row_id=_shared_invoice_row_id,
             )
+            _pending_file_path = None  # only first item in fallback path attaches the file
             if result["status"] == "ok":
                 statuses[idx_str] = "approved"
                 results.append(f"{idx_str}: ✓ {item['sp_code']} → RM{item['new_price']:.2f}")
