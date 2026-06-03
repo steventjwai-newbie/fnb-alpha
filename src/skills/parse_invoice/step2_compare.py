@@ -457,8 +457,9 @@ def format_telegram_message(payload: Dict[str, Any]) -> str:
             if c.get("promotion_note"):
                 flags.append(f"🏷️ {c['promotion_note']}")
             flag_str = " " + " ".join(flags) if flags else ""
+            diff_str = f"{c['diff_pct']}%" if isinstance(c.get("diff_pct"), (int, float)) else "new"
             lines.append(f"  {item_idx}. {c['product_name']} → {c['seatable_product']} ({c['match_score']}%){flag_str}")
-            lines.append(f"     RM{c['old_price']:.2f} → RM{c['new_price']:.2f}/{c['unit']} ({c['diff_pct']}%)")
+            lines.append(f"     RM{c['old_price']:.2f} → RM{c['new_price']:.2f}/{c['unit']} ({diff_str})")
 
     if payload.get("unmatched_items"):
         lines.append(f"\n⚠️ *Unmatched ({len(payload['unmatched_items'])}):*")

@@ -45,11 +45,18 @@ def upsert_invoice_row(
     Find existing Invoices row by invoice_number or create new one.
     Returns the row's _id, or None on failure.
     """
-    # Search existing
-    existing = base.list_rows(INVOICES_TABLE)
-    for row in existing:
-        if (row.get("Invoice Number") or "").strip() == invoice_number.strip():
-            return row.get("_id")
+    # Search existing (paginated to handle large tables)
+    start = 0
+    while True:
+        batch = base.list_rows(INVOICES_TABLE, start=start, limit=1000)
+        if not batch:
+            break
+        for row in batch:
+            if (row.get("Invoice Number") or "").strip() == invoice_number.strip():
+                return row.get("_id")
+        if len(batch) < 1000:
+            break
+        start += 1000
 
     # Create new
     row_payload = {

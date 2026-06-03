@@ -88,7 +88,10 @@ SYSTEM_PROMPT = (
     '}\n\n'
     "Rules:\n"
     "- Line items may span multiple visual lines — treat them as one item.\n"
-    "- For dates use YYYY-MM-DD.\n"
+    "- For dates use YYYY-MM-DD. Malaysian invoices use DD/MM/YYYY or DD-MM-YYYY (day first, "
+    "then month, then year) — convert carefully. Example: '03/06/2026' = June 3 = 2026-06-03, "
+    "NOT August 3. When the invoice number contains a date code (e.g. 'IV2606' = June 2026), "
+    "use it to cross-check the extracted date.\n"
     "- For numbers use numeric values, not strings.\n"
     "- If a field is missing or unreadable use null.\n"
     "- supplier_brn: extract the supplier's Business Registration Number (BRN) or Company Registration "
@@ -238,6 +241,14 @@ def _parse_invoices(raw_invoices: list, raw_text: str = None) -> List[Dict[str, 
             flags.append("missing_invoice_number")
         if not invoice_date:
             flags.append("missing_invoice_date")
+        elif invoice_date:
+            try:
+                from datetime import timedelta
+                parsed_date = date.fromisoformat(invoice_date)
+                if parsed_date > date.today() + timedelta(days=45):
+                    flags.append(f"date_possibly_wrong: {invoice_date} is in the future")
+            except ValueError:
+                flags.append(f"date_parse_error: {invoice_date}")
         if has_handwriting:
             flags.append("handwriting_detected")
 
