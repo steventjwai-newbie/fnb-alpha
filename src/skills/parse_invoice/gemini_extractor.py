@@ -219,7 +219,8 @@ def extract_invoice_gemini(file_path: str) -> Dict[str, Any]:
 
         except Exception as e:
             err = str(e)
-            is_rate_limit = "429" in err or "quota" in err.lower() or "resource_exhausted" in err.lower()
+            is_rate_limit = ("429" in err or "503" in err or "quota" in err.lower()
+                             or "resource_exhausted" in err.lower() or "unavailable" in err.lower())
             if is_rate_limit and attempt < len(_RETRY_DELAYS):
                 continue
             duration_ms = int((time.time() - start_time) * 1000)

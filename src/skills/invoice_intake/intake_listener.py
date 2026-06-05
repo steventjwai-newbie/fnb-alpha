@@ -10,6 +10,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import random
+
 import requests
 from dotenv import load_dotenv
 
@@ -300,6 +302,7 @@ def _handle_update(update: dict, state: dict) -> None:
             print(f"[LOG] /yes — force processing {p['file_path']}")
             try:
                 _process_file(p["file_path"], state, force=True)
+                time.sleep(random.uniform(3, 10))
             except Exception as e:
                 print(f"[LOG] Error force processing: {e}")
                 notify_parse_failure(p["file_path"], str(e))
@@ -335,6 +338,7 @@ def _handle_update(update: dict, state: dict) -> None:
 
     try:
         _process_file(str(output_path), state)
+        time.sleep(random.uniform(3, 10))
     except Exception as e:
         print(f"[LOG] Error processing {output_path}: {e}")
         notify_parse_failure(str(output_path), str(e))
