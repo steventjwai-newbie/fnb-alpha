@@ -57,6 +57,7 @@ CONTAINER_UNITS = {
     "bag", "sack",
     "tin", "can",
     "tray", "punnet", "roll",
+    "block",
     "biji",  # Bahasa for "piece"
 }
 
