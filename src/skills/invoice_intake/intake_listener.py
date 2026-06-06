@@ -180,17 +180,19 @@ def _total_line(invoice: dict, warnings: list) -> str | None:
 
 # ── Core processing ────────────────────────────────────────────────────────────
 
-def _process_file(file_path: str, state: dict, force: bool = False) -> None:
+def _process_file(file_path: str, state: dict, force: bool = False, _notify_on_fail: bool = True) -> bool:
     step1 = extract_invoice(file_path)
 
     if step1.get("status") == "error":
-        notify_parse_failure(file_path, step1.get("error_message", "unknown error"))
-        return
+        if _notify_on_fail:
+            notify_parse_failure(file_path, step1.get("error_message", "unknown error"))
+        return False
 
     invoices = step1.get("invoices", [])
     if not invoices:
-        notify_parse_failure(file_path, "No invoices found in file")
-        return
+        if _notify_on_fail:
+            notify_parse_failure(file_path, "No invoices found in file")
+        return False
 
     invoice = invoices[0]
     invoice_number = (invoice.get("invoice_number") or "").strip()
@@ -237,12 +239,14 @@ def _process_file(file_path: str, state: dict, force: bool = False) -> None:
 
             step1 = extract_invoice(combined_path)
             if step1.get("status") == "error":
-                notify_parse_failure(combined_path, step1.get("error_message", "unknown error"))
-                return
+                if _notify_on_fail:
+                    notify_parse_failure(combined_path, step1.get("error_message", "unknown error"))
+                return False
             invoices = step1.get("invoices", [])
             if not invoices:
-                notify_parse_failure(combined_path, "No invoices found after combining")
-                return
+                if _notify_on_fail:
+                    notify_parse_failure(combined_path, "No invoices found after combining")
+                return False
 
             if not all_have_page:
                 for inv in step1.get("invoices", []):
@@ -272,9 +276,26 @@ def _process_file(file_path: str, state: dict, force: bool = False) -> None:
 
     payloads = build_comparison(step1)
     for payload in payloads:
-        # Add file path for optional file attachment to Invoices
         payload["invoice_file_path"] = str(file_path)
         notify_invoice_comparison(payload)
+    return True
+
+
+_MAX_PARSE_RETRIES = 3
+
+
+def _retry_process(file_path: str, state: dict, force: bool = False) -> None:
+    """Run _process_file up to _MAX_PARSE_RETRIES times. Notifies only on final failure."""
+    for attempt in range(_MAX_PARSE_RETRIES):
+        is_last = attempt == _MAX_PARSE_RETRIES - 1
+        ok = _process_file(file_path, state, force=force, _notify_on_fail=is_last)
+        if ok:
+            time.sleep(random.uniform(3, 10))
+            return
+        if not is_last:
+            delay = random.uniform(30, 60)
+            print(f"[LOG] Parse attempt {attempt + 1}/{_MAX_PARSE_RETRIES} failed, retrying in {delay:.0f}s...")
+            time.sleep(delay)
 
 
 # ── Update handler ─────────────────────────────────────────────────────────────
@@ -301,8 +322,7 @@ def _handle_update(update: dict, state: dict) -> None:
             state["pending_non_invoice"] = [x for x in pending if x is not p]
             print(f"[LOG] /yes — force processing {p['file_path']}")
             try:
-                _process_file(p["file_path"], state, force=True)
-                time.sleep(random.uniform(3, 10))
+                _retry_process(p["file_path"], state, force=True)
             except Exception as e:
                 print(f"[LOG] Error force processing: {e}")
                 notify_parse_failure(p["file_path"], str(e))
@@ -337,8 +357,7 @@ def _handle_update(update: dict, state: dict) -> None:
         return
 
     try:
-        _process_file(str(output_path), state)
-        time.sleep(random.uniform(3, 10))
+        _retry_process(str(output_path), state)
     except Exception as e:
         print(f"[LOG] Error processing {output_path}: {e}")
         notify_parse_failure(str(output_path), str(e))
