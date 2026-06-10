@@ -270,7 +270,8 @@ async def _send_ingredient_prompt_llm(query, state: Dict[str, Any], invoice_num:
             f"Link: {match_name}",
             callback_data=f"link_ingredient:{invoice_num}:{match_row_id}"
         )])
-    cb_name = suggested_name[:40]  # Telegram callback_data hard limit is 64 bytes
+    _prefix = f"create_ingredient:{invoice_num}:"
+    cb_name = suggested_name[:max(64 - len(_prefix.encode("utf-8")), 8)]
     keyboard.append([InlineKeyboardButton(
         f"Create: {cb_name}",
         callback_data=f"create_ingredient:{invoice_num}:{cb_name}"

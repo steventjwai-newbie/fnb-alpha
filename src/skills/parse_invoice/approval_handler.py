@@ -91,6 +91,7 @@ def build_inline_keyboard(payload: Dict[str, Any]) -> Optional[InlineKeyboardMar
             InlineKeyboardButton(f"✓ {i}", callback_data=f"yes:{invoice_num}:{i}"),
             InlineKeyboardButton(f"✗ {i}", callback_data=f"no:{invoice_num}:{i}"),
             InlineKeyboardButton(f"⏭ {i}", callback_data=f"skip:{invoice_num}:{i}"),
+            InlineKeyboardButton(f"↩ {i}", callback_data=f"reassign:{invoice_num}:{i}"),
         ]
         keyboard.append(row)
 
@@ -101,6 +102,195 @@ def build_inline_keyboard(payload: Dict[str, Any]) -> Optional[InlineKeyboardMar
     ])
 
     return InlineKeyboardMarkup(keyboard)
+
+
+# ============================================================
+# Reassign handler — manual correction of wrong match
+# ============================================================
+
+async def _handle_reassign(query, action: str, invoice_num: str, user_ref: str) -> None:
+    """
+    reassign:{invoice_num}:{idx}        — show top-5 SP candidates for item idx
+    reassign_pick:{invoice_num}:{idx}:{sp_row_id} — apply chosen SP to item
+    reassign_cancel:{invoice_num}:{idx} — restore full invoice comparison view
+    """
+    from rapidfuzz import fuzz
+    from seatable_writer import _base as _sw_base
+    from step2_compare import format_telegram_message
+
+    raw_parts = query.data.split(":", 2)
+    extra = raw_parts[2] if len(raw_parts) > 2 else ""
+
+    if action in ("reassign", "reassign_cancel"):
+        try:
+            idx = int(extra)
+        except ValueError:
+            await query.answer("Bad index", show_alert=True)
+            return
+
+    if action == "reassign_cancel":
+        payload = load_pending(invoice_num)
+        if not payload:
+            return
+        try:
+            await query.edit_message_text(
+                format_telegram_message(payload),
+                reply_markup=build_inline_keyboard(payload),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            print(f"[ERROR] reassign_cancel edit failed: {e}")
+        return
+
+    if action == "reassign":
+        payload = load_pending(invoice_num)
+        if not payload:
+            await query.edit_message_text(query.message.text + "\n\n❌ Payload missing.")
+            return
+
+        items = get_actionable_items(payload)
+        try:
+            item = items[idx - 1]
+        except IndexError:
+            await query.answer("Item not found", show_alert=True)
+            return
+
+        product_name = item.get("product_name") or ""
+        supplier_row_id = payload.get("supplier_row_id") or ""
+
+        try:
+            base = _sw_base()
+            candidates = []
+            start = 0
+            while True:
+                batch = base.list_rows("Supplier Products", start=start, limit=1000)
+                if not batch:
+                    break
+                for row in batch:
+                    if supplier_row_id:
+                        links = row.get("Supplier") or []
+                        link_ids = [
+                            lnk.get("row_id") if isinstance(lnk, dict) else str(lnk)
+                            for lnk in links
+                        ]
+                        if supplier_row_id not in link_ids:
+                            continue
+                    name = row.get("Supplier Product Name") or ""
+                    if not name:
+                        continue
+                    score = fuzz.token_set_ratio(product_name.lower(), name.lower())
+                    candidates.append({
+                        "name": name,
+                        "row_id": row["_id"],
+                        "score": score,
+                        "price": row.get("Price per Pack"),
+                        "sp_code": row.get("SP Code") or row["_id"][:8],
+                    })
+                if len(batch) < 1000:
+                    break
+                start += 1000
+        except Exception as e:
+            await query.edit_message_text(query.message.text + f"\n\n❌ Search failed: {e}")
+            return
+
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+        top5 = candidates[:5]
+
+        # Cache candidates in payload so reassign_pick doesn't need another DB call
+        payload["_reassign_cache"] = {c["row_id"]: c for c in top5}
+        update_pending(invoice_num, payload)
+
+        keyboard = []
+        for c in top5:
+            cb = f"reassign_pick:{invoice_num}:{idx}:{c['row_id']}"
+            if len(cb.encode("utf-8")) <= 64:
+                price_str = f" RM{float(c['price']):.2f}" if c.get("price") is not None else ""
+                label = f"{c['name'][:26]} ({c['score']:.0f}%){price_str}"
+                keyboard.append([InlineKeyboardButton(label, callback_data=cb)])
+        keyboard.append([
+            InlineKeyboardButton("← Cancel", callback_data=f"reassign_cancel:{invoice_num}:{idx}")
+        ])
+
+        try:
+            await query.edit_message_text(
+                f"↩ Reassign item {idx}: *{product_name}*\nPick the correct product:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            print(f"[ERROR] reassign prompt edit failed: {e}")
+        return
+
+    # action == "reassign_pick"
+    extra_parts = extra.split(":", 1)
+    try:
+        idx = int(extra_parts[0])
+        new_sp_row_id = extra_parts[1] if len(extra_parts) > 1 else ""
+    except (ValueError, IndexError):
+        await query.answer("Bad callback", show_alert=True)
+        return
+
+    payload = load_pending(invoice_num)
+    if not payload:
+        await query.edit_message_text("❌ Payload missing.")
+        return
+
+    # Look up SP data from cache (set during reassign step)
+    cache = payload.get("_reassign_cache", {})
+    sp_data = cache.get(new_sp_row_id)
+    if not sp_data:
+        await query.answer("Cache expired — tap ↩ again", show_alert=True)
+        return
+
+    new_name = sp_data["name"]
+    new_sp_code = sp_data["sp_code"]
+    new_old_price = sp_data.get("price")
+
+    if new_old_price is None:
+        await query.answer(f"No price set for '{new_name}' — data gap", show_alert=True)
+        return
+
+    pc_list = payload.get("price_changes", [])
+    ci_list = payload.get("confirm_items", [])
+    pc_len = len(pc_list)
+
+    def _patch(target: dict) -> dict:
+        updated = dict(target)
+        updated["seatable_product"] = new_name
+        updated["sp_row_id"] = new_sp_row_id
+        updated["sp_code"] = new_sp_code
+        updated["old_price"] = float(new_old_price)
+        updated["match_score"] = 100
+        new_price = updated.get("new_price")
+        if new_price is not None and float(new_old_price):
+            updated["diff_pct"] = round(
+                abs(new_price - float(new_old_price)) / float(new_old_price) * 100, 1
+            )
+        return updated
+
+    if idx <= pc_len:
+        payload["price_changes"][idx - 1] = _patch(pc_list[idx - 1])
+    else:
+        ci_idx = idx - pc_len - 1
+        if 0 <= ci_idx < len(ci_list):
+            payload["confirm_items"][ci_idx] = _patch(ci_list[ci_idx])
+
+    # Clean up cache
+    payload.pop("_reassign_cache", None)
+    update_pending(invoice_num, payload)
+
+    new_text = (
+        format_telegram_message(payload)
+        + f"\n\n✏️ {user_ref}: reassigned item {idx} → {new_name}"
+    )
+    try:
+        await query.edit_message_text(
+            new_text,
+            reply_markup=build_inline_keyboard(payload),
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        print(f"[ERROR] reassign_pick edit failed: {e}")
 
 
 # ============================================================
@@ -181,6 +371,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e:
             await query.edit_message_text(query.message.text + f"\n\n❌ Failed: {e}")
+        return
+
+    # Reassign flow — manual correction of wrong match or wrong parse
+    if action in ("reassign", "reassign_pick", "reassign_cancel"):
+        await _handle_reassign(query, action, invoice_num, user_ref)
         return
 
     # Parse approval callback (action, invoice_num, target)
