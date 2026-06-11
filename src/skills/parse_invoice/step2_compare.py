@@ -190,6 +190,30 @@ def _sp_ref(matched_product: Dict) -> str:
     return matched_product.get(SP_CODE_COLUMN) or matched_product.get("_id", "")[:8]
 
 
+def _extract_pack_multiplier(pack_size_str: str) -> Optional[float]:
+    """
+    Extract pack multiplier from Pack Size field.
+    Examples:
+    - "1ctn x 6pkt x 2kg" → 6
+    - "1 case x 12 units x 500ml" → 12
+    - "1 box x 24 pieces" → 24
+    Returns None if can't extract.
+    """
+    if not pack_size_str:
+        return None
+
+    # Pattern: digit(s) after x/×/* followed by sub-unit keywords (not weight/volume)
+    match = re.search(
+        r'[x×*]\s*(\d+(?:\.\d+)?)\s*(?:pkt|packet|piece|pc|unit|ea|each|biji|pcs)',
+        pack_size_str,
+        re.IGNORECASE
+    )
+    if match:
+        return float(match.group(1))
+
+    return None
+
+
 def build_comparison(step1_result: Dict[str, Any]) -> List[Dict[str, Any]]:
     if step1_result.get("status") != "success":
         return []
@@ -320,10 +344,32 @@ def build_comparison(step1_result: Dict[str, Any]) -> List[Dict[str, Any]]:
 
             # Unit handling: two paths
             container_assumed = False
+            pack_multiplier_applied = None
             if _is_container_unit(invoice_unit):
                 # Container unit on invoice → assume 1 invoice unit = 1 supplier pack
-                # Compare directly to Price per Pack
-                new_price_per_pack = Decimal(str(invoice_unit_price))
+                # BUT: test if invoice price is actually per sub-unit (pkt) using Pack Size multiplier
+                pack_size = matched_product.get("Pack Size") or ""
+                multiplier = _extract_pack_multiplier(pack_size)
+
+                hypothesis_per_ctn = Decimal(str(invoice_unit_price))
+
+                if multiplier and multiplier > 1:
+                    hypothesis_per_pkt = Decimal(str(invoice_unit_price)) * Decimal(str(multiplier))
+                    sp_price_decimal = Decimal(str(old_price_f))
+
+                    # Calculate deviation for both hypotheses
+                    diff_ctn_pct = abs(hypothesis_per_ctn - sp_price_decimal) / sp_price_decimal * 100 if old_price_f else float('inf')
+                    diff_pkt_pct = abs(hypothesis_per_pkt - sp_price_decimal) / sp_price_decimal * 100 if old_price_f else float('inf')
+
+                    # Prefer per-pkt hypothesis if significantly closer AND within 15% tolerance
+                    if diff_pkt_pct < diff_ctn_pct and diff_pkt_pct < 15:
+                        new_price_per_pack = hypothesis_per_pkt
+                        pack_multiplier_applied = multiplier
+                    else:
+                        new_price_per_pack = hypothesis_per_ctn
+                else:
+                    new_price_per_pack = hypothesis_per_ctn
+
                 container_assumed = True
             else:
                 # Measurement unit → real conversion
@@ -371,6 +417,9 @@ def build_comparison(step1_result: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "diff_pct": round(diff_pct, 1),
             }
 
+            if pack_multiplier_applied:
+                item_payload["pack_multiplier_applied"] = pack_multiplier_applied
+
             if item.get("is_promotional"):
                 item_payload["promotion_note"] = item.get("promotion_note")
                 item_payload["candidates"] = _make_candidates(results)
@@ -390,6 +439,8 @@ def build_comparison(step1_result: Dict[str, Any]) -> List[Dict[str, Any]]:
                 # Container unit assumed = pack. Always /yes required.
                 item_payload["container_assumed"] = True
                 item_payload["candidates"] = _make_candidates(results)
+                if diff_pct > PRICE_CHANGE_SANITY_CAP_PCT:
+                    item_payload["magnitude_flag"] = True
                 confirm_items.append(item_payload)
             elif match_score < AUTO_ACCEPT or diff_pct > PRICE_CHANGE_SANITY_CAP_PCT:
                 item_payload["candidates"] = _make_candidates(results)
@@ -408,6 +459,12 @@ def build_comparison(step1_result: Dict[str, Any]) -> List[Dict[str, Any]]:
             else:
                 price_changes.append(item_payload)
 
+        invoice_total = invoice.get("invoice_total")
+        invoice_items_sum = sum(
+            float(item.get("total_price") or 0)
+            for item in invoice.get("line_items", [])
+        )
+
         payloads.append({
             "invoice_number": invoice_number,
             "supplier_name": supplier_name,
@@ -423,6 +480,8 @@ def build_comparison(step1_result: Dict[str, Any]) -> List[Dict[str, Any]]:
             "unit_mismatches": unit_mismatches,
             "handwriting": invoice.get("handwriting_content"),
             "has_handwriting": bool(invoice.get("has_handwriting")),
+            "invoice_total": float(invoice_total) if invoice_total is not None else None,
+            "invoice_items_sum": round(invoice_items_sum, 2),
         })
 
     return payloads
@@ -452,7 +511,10 @@ def format_telegram_message(payload: Dict[str, Any]) -> str:
             item_idx += 1
             flags = []
             if c.get("container_assumed"):
-                flags.append("📦 container=pack assumed")
+                if c.get("pack_multiplier_applied"):
+                    flags.append(f"📦 container=pack (×{c['pack_multiplier_applied']:.0f})")
+                else:
+                    flags.append("📦 container=pack assumed")
             if c.get("magnitude_flag"):
                 flags.append("⚠️ large change")
             if c.get("promotion_note"):
@@ -488,6 +550,18 @@ def format_telegram_message(payload: Dict[str, Any]) -> str:
 
     if payload.get("has_handwriting") and payload.get("handwriting"):
         lines.append(f"\n✍️ _{payload['handwriting']}_")
+
+    inv_total = payload.get("invoice_total")
+    items_sum = payload.get("invoice_items_sum")
+    if inv_total is not None or items_sum is not None:
+        parts = []
+        if items_sum is not None:
+            parts.append(f"items RM{items_sum:.2f}")
+        if inv_total is not None:
+            mismatch = items_sum is not None and abs(items_sum - inv_total) > 0.10
+            flag = " ⚠️" if mismatch else ""
+            parts.append(f"invoice RM{inv_total:.2f}{flag}")
+        lines.append(f"\n📊 {' · '.join(parts)}")
 
     return "\n".join(lines)
 

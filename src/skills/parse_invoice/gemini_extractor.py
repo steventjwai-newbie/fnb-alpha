@@ -2,6 +2,7 @@ import json
 import os
 import re
 import time
+import requests
 from datetime import date
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -14,9 +15,16 @@ _TICK_ONLY = re.compile(r'^[\s✓✔√,./]+$')
 
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# Support paid tier with higher request limits
+_USE_PAID_TIER = os.getenv("USE_GEMINI_PAID_TIER", "false").lower() == "true"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY_PAID" if _USE_PAID_TIER else "GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-_GEMINI_RPD = int(os.getenv("GEMINI_RPD", "20"))
+_GEMINI_RPD = int(os.getenv("GEMINI_RPD", "1000" if _USE_PAID_TIER else "20"))
+
+if _USE_PAID_TIER:
+    print("[LOG] Using Gemini PAID tier (higher request limits)")
+else:
+    print("[LOG] Using Gemini FREE tier (20 requests/day limit)")
 _USAGE_PATH = Path(__file__).parent.parent.parent.parent / "data" / "gemini_daily_usage.json"
 
 
@@ -147,6 +155,57 @@ MIME_MAP = {
 }
 
 
+def _encode_file_to_base64(file_path: str) -> str:
+    """Encode file to base64 for API submission."""
+    import base64
+    with open(file_path, "rb") as f:
+        return base64.standard_b64encode(f.read()).decode("utf-8")
+
+
+def _call_vertex_ai_api(file_path: str, mime_type: str, base64_data: str) -> Dict[str, Any]:
+    """Call Vertex AI Gemini API via REST (for paid tier)."""
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "inlineData": {
+                            "mimeType": mime_type,
+                            "data": base64_data
+                        }
+                    },
+                    {
+                        "text": SYSTEM_PROMPT
+                    }
+                ]
+            }
+        ],
+        "generationConfig": {
+            "responseMimeType": "application/json"
+        }
+    }
+
+    url = f"https://aiplatform.googleapis.com/v1/publishers/google/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+
+    try:
+        response = requests.post(url, json=payload, timeout=120)
+        response.raise_for_status()
+        data = response.json()
+
+        # Extract the generated text from Vertex AI response format
+        if "candidates" in data and len(data["candidates"]) > 0:
+            content = data["candidates"][0].get("content", {})
+            parts = content.get("parts", [])
+            if parts and "text" in parts[0]:
+                return json.loads(parts[0]["text"])
+        return {}
+    except requests.exceptions.HTTPError as e:
+        raise Exception(f"{e.response.status_code} {e.response.reason}. {e.response.text}")
+    except Exception as e:
+        raise Exception(str(e))
+
+
 def extract_invoice_gemini(file_path: str) -> Dict[str, Any]:
     """Extract invoice data from PDF or image using Gemini as fallback."""
     start_time = time.time()
@@ -168,8 +227,6 @@ def extract_invoice_gemini(file_path: str) -> Dict[str, Any]:
         error_msg = f"Gemini daily limit reached ({used}/{_GEMINI_RPD}). Try again tomorrow."
         return _error_response(file_path, error_msg, 0)
 
-    client = genai.Client(api_key=GEMINI_API_KEY)
-
     with open(file_path, "rb") as f:
         file_bytes = f.read()
 
@@ -182,21 +239,29 @@ def extract_invoice_gemini(file_path: str) -> Dict[str, Any]:
 
         try:
             print(f"[LOG] Calling Gemini for: {file_path}")
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=[
-                    types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
-                    SYSTEM_PROMPT,
-                ],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                ),
-            )
+
+            if _USE_PAID_TIER:
+                # Vertex AI API (paid tier via GCP)
+                base64_data = _encode_file_to_base64(file_path)
+                gemini_data = _call_vertex_ai_api(file_path, mime_type, base64_data)
+            else:
+                # AI Studio API (free tier)
+                client = genai.Client(api_key=GEMINI_API_KEY)
+                response = client.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=[
+                        types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
+                        SYSTEM_PROMPT,
+                    ],
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                    ),
+                )
+                raw = response.text.strip()
+                gemini_data = json.loads(raw)
 
             duration_ms = int((time.time() - start_time) * 1000)
-            raw = response.text.strip()
-            gemini_data = json.loads(raw)
-            invoices = _parse_invoices(gemini_data.get("invoices", []), raw_text=raw)
+            invoices = _parse_invoices(gemini_data.get("invoices", []), raw_text=json.dumps(gemini_data))
 
             daily_count = _increment_usage()
             print(

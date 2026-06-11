@@ -204,8 +204,8 @@ async def _handle_reassign(query, action: str, invoice_num: str, user_ref: str) 
         for c in top5:
             cb = f"reassign_pick:{invoice_num}:{idx}:{c['row_id']}"
             if len(cb.encode("utf-8")) <= 64:
-                price_str = f" RM{float(c['price']):.2f}" if c.get("price") is not None else ""
-                label = f"{c['name'][:26]} ({c['score']:.0f}%){price_str}"
+                price_str = f" RM{float(c['price']):.0f}" if c.get("price") is not None else ""
+                label = f"{c['name'][:18]} ({c['score']:.0f}%){price_str}"
                 keyboard.append([InlineKeyboardButton(label, callback_data=cb)])
         keyboard.append([
             InlineKeyboardButton("← Cancel", callback_data=f"reassign_cancel:{invoice_num}:{idx}")
